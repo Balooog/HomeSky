@@ -21,16 +21,18 @@ except ImportError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
 
-CONFIG_PATH = Path("config.toml")
+CONFIG_PATHS = [Path("config.toml"), Path("homesky/config.toml")]
 
 
-def load_config(path: Path = CONFIG_PATH) -> Dict:
-    if not path.exists():
-        raise FileNotFoundError(
-            "config.toml not found. Copy config.example.toml and populate your credentials."
-        )
-    with path.open("rb") as fh:
-        return tomllib.load(fh)
+def load_config(path: Path | None = None) -> Dict:
+    candidates = [path] if path else CONFIG_PATHS
+    for candidate in candidates:
+        if candidate and candidate.exists():
+            with candidate.open("rb") as fh:
+                return tomllib.load(fh)
+    raise FileNotFoundError(
+        "config.toml not found. Run tools/ensure_config.ps1 or copy homesky/config.example.toml to homesky/config.toml and populate your credentials."
+    )
 
 
 def setup_logging(config: Dict) -> None:

@@ -12,6 +12,32 @@ import PySimpleGUI as sg
 import ingest
 from utils.db import DatabaseManager
 
+PACKAGE_DIR = Path(__file__).resolve().parent
+CONFIG_EXAMPLE = PACKAGE_DIR / "config.example.toml"
+CONFIG_TARGETS = [Path("config.toml"), PACKAGE_DIR / "config.toml"]
+
+
+def bootstrap_config_file() -> Path:
+    for candidate in CONFIG_TARGETS:
+        if candidate.exists():
+            return candidate
+    target = CONFIG_TARGETS[-1]
+    if CONFIG_EXAMPLE.exists():
+        target.write_text(CONFIG_EXAMPLE.read_text(), encoding="utf-8")
+    else:
+        stub = (
+            "[ambient]\n"
+            "api_key = \"\"\n"
+            "application_key = \"\"\n"
+            "mac = \"\"\n\n"
+            "[storage]\n"
+            "root_dir = \"./data\"\n"
+            "sqlite_path = \"./data/homesky.sqlite\"\n"
+            "parquet_path = \"./data/homesky.parquet\"\n"
+        )
+        target.write_text(stub, encoding="utf-8")
+    return target
+
 
 def load_config() -> dict:
     return ingest.load_config()
@@ -35,7 +61,12 @@ def main() -> None:
     try:
         config = load_config()
     except FileNotFoundError:
-        sg.popup_error("Missing config.toml. Copy config.example.toml and update your credentials.")
+        created_path = bootstrap_config_file()
+        sg.popup_ok(
+            "Missing config.toml. A starter file has been created at\n"
+            f"{created_path.resolve()}\n\nUpdate your Ambient Weather credentials and relaunch HomeSky.",
+            title="HomeSky configuration required",
+        )
         return
     ingest.setup_logging(config)
     storage = config.get("storage", {})
