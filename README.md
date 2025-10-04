@@ -7,6 +7,8 @@ single-user Windows desktop app for Ambient Weather station with long-term captu
 
 **Prereqs:** Git for Windows, Python 3.11+ (recommended), PowerShell.
 
+> PySimpleGUI is distributed via a private index.  When installing dependencies, include `--extra-index-url https://PySimpleGUI.net/install` so the GUI dependency resolves.
+
 ```pwsh
 # 0) Start in a clean spot
 cd $env:USERPROFILE\Desktop
@@ -27,7 +29,7 @@ if (Test-Path .\.venv) { Remove-Item -Recurse -Force .\.venv }
 python -m venv .venv
 . .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r requirements.txt --extra-index-url https://PySimpleGUI.net/install
 
 # 3) Run the app (pick the entry point you need)
 python .\homesky\gui.py
@@ -45,7 +47,7 @@ Keep the console window open while running so you can capture tracebacks or `[Ho
 # 0) Ensure your virtual environment is active
 . .\.venv\Scripts\Activate.ps1
 
-# 1) Install build tooling
+# 1) Install build tooling (after runtime deps)
 pip install -r dev-requirements.txt
 
 # 2) Build (console on for debugging)
