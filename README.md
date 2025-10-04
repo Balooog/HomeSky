@@ -1,7 +1,7 @@
 # HomeSky
 single-user Windows desktop app for Ambient Weather station with long-term capture, Dark-Sky-style visuals, and rich exports (web-ready later)
 
-### Run locally (fast iteration on Windows)
+### Run locally (recommended while iterating)
 
 > Recommended flow while developing.  Start clean, install dependencies, then launch the GUI or dashboard directly without building an EXE.
 
@@ -37,7 +37,7 @@ python .\homesky\gui.py
 
 Keep the console window open while running so you can capture tracebacks or `[HomeSky]` log lines for debugging.
 
-### Build EXE (when you need a packaged app)
+### Build EXE (only for releases or EXE-specific debugging)
 
 > Build only after you are happy with local testing.  Installs PyInstaller from the development requirements and produces a console-enabled executable for easier troubleshooting.
 
@@ -50,9 +50,7 @@ pip install -r dev-requirements.txt
 
 # 2) Build (console on for debugging)
 python -m PyInstaller --onefile --clean --name HomeSky --distpath dist homesky\gui.py
-
-# 3) Inspect the output
-Get-ChildItem .\dist
+.\dist\HomeSky.exe
 ```
 
 **Tips**
