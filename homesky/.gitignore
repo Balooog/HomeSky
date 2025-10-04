@@ -1,0 +1,8 @@
+config.toml
+data/
+logs/
+*.pyc
+__pycache__/
+.build/
+dist/
+.streamlit/
