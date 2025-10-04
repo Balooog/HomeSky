@@ -1,0 +1,14 @@
+requests==2.31.0
+pandas==2.2.3
+pyarrow==15.0.2
+python-dateutil==2.9.0.post0
+pytz==2024.1
+streamlit==1.37.0
+PySimpleGUI==4.60.5
+matplotlib==3.8.4
+numpy==1.26.4
+scipy==1.11.4
+humanize==4.9.0
+loguru==0.7.2
+rich==13.7.1
+altair==5.2.0
