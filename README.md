@@ -1,9 +1,9 @@
 # HomeSky
 single-user Windows desktop app for Ambient Weather station with long-term capture, Dark-Sky-style visuals, and rich exports (web-ready later)
 
-### Build-test (clean pull on Windows)
+### Run locally (fast iteration on Windows)
 
-> You can re-test each merged build locally without editing the repo.  This section clones fresh, resets to the latest `main`, installs deps, runs a quick smoke test, and builds an EXE.  Two spaces between sentences.
+> Recommended flow while developing.  Start clean, install dependencies, then launch the GUI or dashboard directly without building an EXE.
 
 **Prereqs:** Git for Windows, Python 3.11+ (recommended), PowerShell.
 
@@ -22,28 +22,40 @@ if (Test-Path .\HomeSky) {
   cd .\HomeSky
 }
 
-# 2) Clean venv and deps
+# 2) Virtual environment and dependencies
 if (Test-Path .\.venv) { Remove-Item -Recurse -Force .\.venv }
 python -m venv .venv
 . .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 
-# 3) Quick smoke (adjust files as they land in repo)
-# Pull one cycle then open the UI (if present)
-# These are no-ops if files aren't present yet.
-if (Test-Path .\homesky\ingest.py) { python .\homesky\ingest.py --once }
-if (Test-Path .\homesky\visualize_streamlit.py) { Start-Process -FilePath "streamlit" -ArgumentList "run homesky/visualize_streamlit.py" }
+# 3) Run the app (pick the entry point you need)
+python .\homesky\gui.py
+# or
+# streamlit run homesky/visualize_streamlit.py
+```
 
-# 4) Build EXE (console ON for debugging)
-# Replace homesky\gui.py with your actual entry-point if different
+Keep the console window open while running so you can capture tracebacks or `[HomeSky]` log lines for debugging.
+
+### Build EXE (when you need a packaged app)
+
+> Build only after you are happy with local testing.  Installs PyInstaller from the development requirements and produces a console-enabled executable for easier troubleshooting.
+
+```pwsh
+# 0) Ensure your virtual environment is active
+. .\.venv\Scripts\Activate.ps1
+
+# 1) Install build tooling
+pip install -r dev-requirements.txt
+
+# 2) Build (console on for debugging)
 python -m PyInstaller --onefile --clean --name HomeSky --distpath dist homesky\gui.py
 
-Write-Host "Build artifact:"
+# 3) Inspect the output
 Get-ChildItem .\dist
 ```
 
-**Notes**
-- Keep console builds while iterating.  Switch to `--noconsole` once stable.
-- If the repo adds data files (icons, themes), include them with `--add-data` flags in the build command.
-- If you encounter errors, paste the log into our Codex update template in `/codex/updates/`.
+**Tips**
+- Keep console builds while iterating; switch to `--noconsole` once the GUI is stable.
+- Add assets with `--add-data` flags when icons, themes, or config files need to ship inside the EXE.
+- Copy any build or runtime errors into `/codex/updates/` so we can prep the next Codex patch quickly.
