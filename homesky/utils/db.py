@@ -5,11 +5,51 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 from loguru import logger
+
+
+def _json_default(value: object) -> Optional[object]:
+    """Return a JSON-serializable representation for database payloads."""
+
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return None
+        ts = value
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return ts.isoformat().replace("+00:00", "Z")
+    if isinstance(value, datetime):
+        ts = value
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        else:
+            ts = ts.astimezone(timezone.utc)
+        return ts.isoformat().replace("+00:00", "Z")
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:  # pragma: no cover - fallback to string
+            pass
+    if hasattr(value, "tolist"):
+        try:
+            return value.tolist()
+        except Exception:  # pragma: no cover - fallback to string
+            pass
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:  # pragma: no cover - fallback to string
+            pass
+    if value is None:
+        return None
+    return str(value)
 
 
 OBS_TABLE_SQL = """
@@ -89,7 +129,7 @@ class DatabaseManager:
                         epoch_ms = int(parsed_epoch.value // 1_000_000)
                         epoch = epoch or int(parsed_epoch.timestamp())
                 payload_source["epoch_ms"] = epoch_ms
-                payload = json.dumps(payload_source)
+                payload = json.dumps(payload_source, default=_json_default)
                 try:
                     cursor.execute(
                         """
