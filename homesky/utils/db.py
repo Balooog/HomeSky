@@ -84,9 +84,9 @@ class DatabaseManager:
                     )
                     inserted += cursor.rowcount
                 except sqlite3.DatabaseError as exc:  # pragma: no cover
-                    logger.exception("Failed to insert row: %s", exc)
+                    logger.exception("Failed to insert row: {}", exc)
             conn.commit()
-        logger.debug("Inserted %d new rows into SQLite", inserted)
+        logger.debug("Inserted {} new rows into SQLite", inserted)
         return inserted
 
     def fetch_last_timestamp(self, mac: Optional[str] = None) -> Optional[str]:
@@ -141,7 +141,7 @@ class DatabaseManager:
             combined.to_parquet(self.parquet_path, **write_kwargs)
         else:
             df_to_write.to_parquet(self.parquet_path, **write_kwargs)
-        logger.debug("Appended %d rows to Parquet lake", len(df_to_write))
+        logger.debug("Appended {} rows to Parquet lake", len(df_to_write))
 
 
 def ensure_schema(sqlite_path: Path | str) -> None:

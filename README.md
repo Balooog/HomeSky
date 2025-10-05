@@ -118,6 +118,11 @@ notepad .\homesky\config.toml
 python .\homesky\gui.py
 ```
 
+### Configure
+- Edit `homesky/config.toml` with Ambient Weather credentials.
+- Optional: set `[ui] launch_streamlit = true` only when `homesky/visualize_streamlit.py` exists.
+- Rerun: `python .\homesky\gui.py`
+
 ### Build EXE (when packaging)
 
 ```pwsh

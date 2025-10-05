@@ -49,7 +49,7 @@ def setup_logging(config: Dict) -> None:
         backtrace=True,
         enqueue=True,
     )
-    logger.info("Logging initialized at %s", log_path)
+    logger.info("Logging initialized at {}", log_path)
 
 
 def flatten_observations(records: List[Dict]) -> pd.DataFrame:
@@ -140,7 +140,7 @@ def ingest_once(config: Dict, db: DatabaseManager) -> int:
     inserted = db.insert_observations(records_for_db)
     enriched = compute_all_derived(frame.drop(columns=["raw"], errors="ignore"), config)
     db.append_parquet(enriched)
-    logger.info("Ingested %d new observation rows", inserted)
+    logger.info("Ingested {} new observation rows", inserted)
     return inserted
 
 
@@ -153,11 +153,11 @@ def run_loop(config: Dict, db: DatabaseManager) -> None:
             logger.info("Ingest loop interrupted by user")
             raise
         except Exception as exc:  # pragma: no cover
-            logger.exception("Ingest failed: %s", exc)
+            logger.exception("Ingest failed: {}", exc)
         else:
             if inserted:
                 poll_seconds = detect_cadence_seconds(db.read_dataframe(limit=10))
-        logger.info("Sleeping for %s seconds", poll_seconds)
+        logger.info("Sleeping for {} seconds", poll_seconds)
         time.sleep(poll_seconds)
 
 
