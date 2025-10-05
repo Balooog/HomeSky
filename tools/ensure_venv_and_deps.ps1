@@ -26,7 +26,7 @@ $prior = ""
 if (Test-Path $hashFile) { $prior = Get-Content $hashFile -Raw }
 
 if ($current -ne $prior) {
-  Write-Host "[deps] requirements changed or first run -> installing..." -ForegroundColor Yellow
+  Write-Host "[deps] installing/refreshing..." -ForegroundColor Yellow
   pip install -r $ReqPath --extra-index-url $ExtraIndex
   Set-Content -Path $hashFile -Value $current -Encoding UTF8
 } else {
