@@ -60,6 +60,7 @@ python .\homesky\gui.py
 - **Offline imports** – Fill historical gaps without touching the API. Drop CSV/XLSX exports in the GUI via
   **Import file(s)** (or run `python -m homesky.import_offline data/import/*.csv`) and HomeSky will normalize the columns,
   dedupe by `(mac, epoch_ms)`, append to SQLite/Parquet, and write a JSON report to `data/logs/import_*.json`.
+  - Supported formats: `.csv`, `.xlsx` (requires `openpyxl`), and legacy `.xls` when an `xlrd` engine is available. Each file is parsed best-effort with UTF-8 BOM handling.
 
 ### Known-good config template
 

@@ -340,7 +340,12 @@ def main() -> None:
             if not reload_environment():
                 continue
             try:
-                report = import_files(paths, config=config, storage=storage_manager)
+                report = import_files(
+                    paths,
+                    config=config,
+                    storage=storage_manager,
+                    interactive=True,
+                )
             except Exception as exc:
                 sg.popup_error(
                     "Offline import failed.",

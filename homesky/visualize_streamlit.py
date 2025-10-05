@@ -70,6 +70,12 @@ def main() -> None:
 
     _ensure_logging(config)
 
+    config_path = getattr(ingest.load_config, "last_path", None)
+    if config_path is not None:
+        st.caption(f"Config: {config_path}")
+    else:
+        st.caption("Config: using default search path")
+
     theme_choice = config.get("visualization", {}).get("theme", "dark")
     theme = get_theme(theme_choice)
     typography = load_typography()

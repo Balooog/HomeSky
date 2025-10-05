@@ -156,7 +156,8 @@ class DatabaseManager:
         expanded.insert(1, "obs_time_utc", pd.to_datetime(df["obs_time_utc"], errors="coerce", utc=True))
         expanded.insert(2, "obs_time_local", pd.to_datetime(df["obs_time_local"], errors="coerce"))
         expanded.insert(3, "epoch", df["epoch"].values)
-        expanded.insert(4, "epoch_ms", df["epoch_ms"].values)
+        if "epoch_ms" not in expanded.columns:
+            expanded.insert(4, "epoch_ms", df["epoch_ms"].values)
         return expanded
 
     # -- Parquet helpers ------------------------------------------------

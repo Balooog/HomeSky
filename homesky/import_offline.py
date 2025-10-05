@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 from loguru import logger
 
 import ingest
-from storage import StorageManager, canonicalize_records
+from storage import StorageManager
+from utils.timeparse import OfflineTimestampError, parse_offline_timestamp
 
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 
@@ -41,27 +42,74 @@ CANONICAL_RENAMES = {
     "dew_point_f": "dewptf",
     "solar_radiation": "solarradiation",
     "uv": "uv",
+    "station mac": "station_mac",
+    "stationmac": "station_mac",
+    "mac address": "mac",
+    "macaddress": "mac",
+    "device mac": "device_mac",
+    "epochms": "epoch_ms",
 }
 
-TIMESTAMP_COLUMNS = (
-    "dateutc",
-    "timestamp_utc",
-    "datetime_utc",
-    "time_utc",
-    "timestamp",
-    "datetime",
+MAC_COLUMN_NAMES = ("station_mac", "mac", "macaddress", "device_mac")
+LOCAL_TIME_CANDIDATES = (
+    "timestamp_local",
+    "obs_time_local",
+    "datetime_local",
+    "date_local",
 )
 
-LOCAL_TIME_COLUMNS = ("date", "time", "timestamp_local", "datetime_local")
+
+def _normalize_name(value: object) -> str:
+    return "".join(ch for ch in str(value).lower() if ch.isalnum())
+
+
+def _match_columns(columns: Iterable[object], names: Iterable[str]) -> List[str]:
+    normalized: Dict[str, List[str]] = {}
+    for original in columns:
+        normalized.setdefault(_normalize_name(original), []).append(str(original))
+    resolved: List[str] = []
+    for name in names:
+        key = _normalize_name(name)
+        for column in normalized.get(key, []):
+            if column not in resolved:
+                resolved.append(column)
+    return resolved
 
 
 def _read_table(path: Path) -> pd.DataFrame:
     suffix = path.suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
         raise ValueError(f"Unsupported file type: {path}")
-    if suffix == ".csv":
-        return pd.read_csv(path)
-    return pd.read_excel(path, sheet_name=0)
+    try:
+        if suffix == ".csv":
+            return pd.read_csv(path, encoding="utf-8-sig")
+        engines: List[str] = ["openpyxl"]
+        if suffix == ".xls":
+            engines.append("xlrd")
+        last_error: Optional[Exception] = None
+        for engine in engines:
+            try:
+                return pd.read_excel(path, engine=engine)
+            except ImportError as exc:
+                last_error = exc
+                continue
+            except ValueError as exc:
+                last_error = exc
+                if "Excel file format cannot be determined" in str(exc) and engine == "openpyxl" and suffix == ".xls":
+                    continue
+                break
+            except Exception as exc:  # pragma: no cover - defensive guard
+                last_error = exc
+                break
+        if last_error:
+            if isinstance(last_error, ImportError):
+                raise RuntimeError(
+                    "Missing Excel reader. Install 'openpyxl>=3.1' (and 'xlrd' for legacy .xls) to import Excel files."
+                ) from last_error
+            raise RuntimeError(f"Failed to read {path.name}: {last_error}") from last_error
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"Failed to read {path.name}: {exc}") from exc
+    return pd.read_excel(path)
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -74,61 +122,86 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
-def _combine_date_time(df: pd.DataFrame) -> Optional[pd.Series]:
-    if "date" in df.columns and "time" in df.columns:
-        combined = df["date"].astype(str).str.strip() + " " + df["time"].astype(str).str.strip()
-        return pd.to_datetime(combined, utc=True, errors="coerce")
+def _normalize_string_series(series: pd.Series) -> pd.Series:
+    normalized = series.astype("string").str.strip()
+    return normalized.where(normalized != "", pd.NA)
+
+
+def _resolve_station_series(df: pd.DataFrame, mac_hint: Optional[str]) -> Optional[pd.Series]:
+    candidate_columns = _match_columns(df.columns, MAC_COLUMN_NAMES)
+    for column in candidate_columns:
+        series = _normalize_string_series(df[column])
+        if series.notna().any():
+            if mac_hint:
+                series = series.fillna(mac_hint)
+            return series.astype("string")
+    if mac_hint:
+        return pd.Series([mac_hint] * len(df), index=df.index, dtype="string")
     return None
-
-
-def _extract_timestamp_series(df: pd.DataFrame) -> pd.Series:
-    for column in TIMESTAMP_COLUMNS:
-        if column in df.columns:
-            series = pd.to_datetime(df[column], utc=True, errors="coerce")
-            if series.notna().any():
-                return series
-    combined = _combine_date_time(df)
-    if combined is not None and combined.notna().any():
-        return combined
-    raise ValueError("Could not determine timestamp column in offline import")
 
 
 def _extract_local_series(df: pd.DataFrame) -> Optional[pd.Series]:
-    for column in LOCAL_TIME_COLUMNS:
-        if column in df.columns:
-            series = pd.to_datetime(df[column], errors="coerce")
-            if series.notna().any():
-                return series
+    for column in LOCAL_TIME_CANDIDATES:
+        matches = _match_columns(df.columns, [column])
+        if not matches:
+            continue
+        series = pd.to_datetime(df[matches[0]], errors="coerce")
+        if series.notna().any():
+            return series
     return None
 
 
-def _frame_to_records(
-    df: pd.DataFrame,
+def _prepare_dataframe(
+    raw: pd.DataFrame,
     *,
-    mac: Optional[str],
-) -> List[dict]:
-    normalized = _normalize_columns(df)
-    timestamps = _extract_timestamp_series(normalized)
+    mac_hint: Optional[str],
+    config: Dict,
+    interactive: bool,
+) -> Tuple[pd.DataFrame, List[str]]:
+    normalized = _normalize_columns(raw)
+    try:
+        timestamp_result = parse_offline_timestamp(normalized, config, interactive=interactive)
+    except OfflineTimestampError as exc:
+        detail_lines = "\n".join(f"- {line}" for line in exc.details) if exc.details else "(no candidate columns)"
+        raise RuntimeError(
+            "Unable to determine a timestamp column.\n" + detail_lines
+        ) from exc
+
+    normalized["timestamp_utc"] = timestamp_result.timestamp_utc
+    normalized["dateutc"] = timestamp_result.timestamp_utc
+    normalized["obs_time_utc"] = timestamp_result.timestamp_utc
+    normalized["epoch_ms"] = timestamp_result.epoch_ms.astype("Int64")
+    normalized["epoch"] = (timestamp_result.epoch_ms // 1000).astype("Int64")
+
+    for line in timestamp_result.details:
+        logger.debug("[offline] %s", line)
+
+    station_series = _resolve_station_series(normalized, mac_hint)
+    if station_series is None:
+        raise RuntimeError(
+            "No station MAC detected. Add [ambient].mac to config.toml or include a station_mac column in the file."
+        )
+    normalized["station_mac"] = station_series
+
+    if "mac" in normalized.columns:
+        mac_series = _normalize_string_series(normalized["mac"]).fillna(station_series)
+    else:
+        mac_series = station_series
+    normalized["mac"] = mac_series.astype("string")
+
     local_series = _extract_local_series(normalized)
-    records: List[dict] = []
-    for idx, row in normalized.iterrows():
-        timestamp = timestamps.iloc[idx] if idx < len(timestamps) else pd.NaT
-        if pd.isna(timestamp):
-            continue
-        payload: Dict[str, object] = {}
-        for column, value in row.items():
-            if pd.isna(value):
-                continue
-            payload[column] = value
-        payload["dateutc"] = timestamp.tz_convert(timezone.utc) if timestamp.tzinfo else timestamp.tz_localize(timezone.utc)
-        if local_series is not None and idx < len(local_series):
-            local_value = local_series.iloc[idx]
-            if pd.notna(local_value):
-                payload["date"] = local_value
-        if mac:
-            payload.setdefault("mac", mac)
-        records.append(payload)
-    return records
+    if local_series is not None:
+        normalized["timestamp_local"] = local_series
+    else:
+        tz_name = str(config.get("timezone", {}).get("local_tz") or "UTC")
+        try:
+            normalized["timestamp_local"] = timestamp_result.timestamp_utc.dt.tz_convert(tz_name)
+        except Exception as exc:  # pragma: no cover - timezone fallback
+            logger.debug("Unable to convert timestamps to %s: %s", tz_name, exc)
+
+    valid = normalized.dropna(subset=["epoch_ms", "timestamp_utc", "station_mac"])
+    valid = valid.reset_index(drop=True)
+    return valid, timestamp_result.details
 
 
 def _write_report(config: Dict, report: Dict) -> Path:
@@ -147,49 +220,90 @@ def import_files(
     *,
     config: Dict,
     storage: StorageManager,
+    interactive: bool = False,
 ) -> Dict:
     mac = config.get("ambient", {}).get("mac")
     summaries: List[Dict] = []
     total_inserted = 0
     total_rows = 0
-    canonical_rows = 0
+    total_after_dedup = 0
+    total_duplicates = 0
     overall_start: Optional[pd.Timestamp] = None
     overall_end: Optional[pd.Timestamp] = None
 
     for path in paths:
-        df = _read_table(path)
-        records = _frame_to_records(df, mac=mac)
+        try:
+            df = _read_table(path)
+        except Exception as exc:
+            raise RuntimeError(f"{path.name}: {exc}") from exc
+        try:
+            prepared, timestamp_details = _prepare_dataframe(
+                df,
+                mac_hint=mac,
+                config=config,
+                interactive=interactive,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(f"{path.name}: {exc}") from exc
         total_rows += len(df)
-        canonical = canonicalize_records(records, mac_hint=mac)
-        canonical_rows += len(canonical)
-        result = storage.upsert_canonical(canonical)
-        total_inserted += result.inserted
+        if prepared.empty:
+            summaries.append(
+                {
+                    "path": str(path),
+                    "rows_read": len(df),
+                    "rows_valid": 0,
+                    "rows_after_dedup": 0,
+                    "rows_inserted": 0,
+                    "rows_duplicates": 0,
+                    "timestamp_details": timestamp_details,
+                }
+            )
+            logger.warning("No valid rows detected in %s", path.name)
+            continue
+
+        deduped = prepared.drop_duplicates(subset=["station_mac", "epoch_ms"])
+        dropped_duplicates = len(prepared) - len(deduped)
+        result = storage.upsert_dataframe(deduped, mac_hint=mac)
+        inserted = result.inserted
+        duplicates_in_db = len(deduped) - inserted
+
+        total_after_dedup += len(deduped)
+        total_inserted += inserted
+        total_duplicates += dropped_duplicates + duplicates_in_db
+
         if result.start is not None:
             overall_start = result.start if overall_start is None else min(overall_start, result.start)
         if result.end is not None:
             overall_end = result.end if overall_end is None else max(overall_end, result.end)
+
         summaries.append(
             {
                 "path": str(path),
                 "rows_read": len(df),
-                "rows_normalized": len(canonical),
-                "rows_inserted": result.inserted,
+                "rows_valid": len(prepared),
+                "rows_after_dedup": len(deduped),
+                "rows_inserted": inserted,
+                "rows_duplicates": dropped_duplicates + duplicates_in_db,
+                "timestamp_details": timestamp_details,
                 "time_start": result.start.isoformat() if result.start is not None else None,
                 "time_end": result.end.isoformat() if result.end is not None else None,
             }
         )
+
         logger.info(
-            "Imported %s rows from %s (inserted %s new rows)",
+            "Imported %s rows from %s (%s new, %s duplicates)",
             len(df),
-            path,
-            result.inserted,
+            path.name,
+            inserted,
+            dropped_duplicates + duplicates_in_db,
         )
 
     report = {
         "files": summaries,
         "total_rows": total_rows,
-        "total_normalized": canonical_rows,
+        "total_after_dedup": total_after_dedup,
         "total_inserted": total_inserted,
+        "total_duplicates": total_duplicates,
         "time_start": overall_start.isoformat() if overall_start is not None else None,
         "time_end": overall_end.isoformat() if overall_end is not None else None,
     }
@@ -208,11 +322,10 @@ def main() -> None:
     args = parse_args()
     config = ingest.load_config()
     storage = ingest.get_storage_manager(config)
-    report = import_files(args.paths, config=config, storage=storage)
+    report = import_files(args.paths, config=config, storage=storage, interactive=False)
     logger.info("Offline import complete: %s rows inserted", report["total_inserted"])
     logger.info("Import report saved to %s", report["report_path"])
 
 
 if __name__ == "__main__":
     main()
-
