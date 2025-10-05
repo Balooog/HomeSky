@@ -7,12 +7,18 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 import PySimpleGUI as sg
 
 import ingest
 from backfill import backfill_range
-from import_offline import import_files
+from import_offline import (
+    TimestampDetectionError,
+    TimestampOverride,
+    import_files,
+    save_timestamp_mapping,
+)
 from storage import StorageResult
 
 try:
@@ -73,7 +79,165 @@ def _format_timestamp(ts: object) -> str:
         dt = dt.replace(tzinfo=timezone.utc)
     else:
         dt = dt.astimezone(timezone.utc)
-    return dt.strftime("%Y-%m-%d %H:%M UTC")
+    epoch_ms = int(dt.timestamp() * 1000)
+    iso_utc = datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).isoformat()
+    return iso_utc.replace("+00:00", "Z")
+
+
+def _prompt_timestamp_override(
+    path: Path,
+    error: TimestampDetectionError,
+    config: dict,
+) -> tuple[TimestampOverride | None, bool]:
+    columns = error.columns or list(error.rename_map.keys())
+    if not columns:
+        sg.popup_error(
+            "HomeSky could not detect any columns in the selected file.",
+            f"Check {error.sample_path} for a saved sample.",
+            title="Timestamp detection failed",
+        )
+        return None, False
+    preview = error.preview.copy()
+    if preview.empty:
+        preview_rows: list[list[str]] = []
+        headings = columns
+    else:
+        preview = preview.fillna("").astype(str)
+        headings = [str(col) for col in preview.columns]
+        preview_rows = preview.values.tolist()
+    default_tz = str(config.get("timezone", {}).get("local_tz") or "UTC")
+    kind_options = [
+        ("ISO 8601 (includes timezone)", "iso"),
+        ("Epoch milliseconds", "epoch_ms"),
+        ("Epoch seconds", "epoch"),
+        (f"Locale datetime (convert from {default_tz})", "local"),
+        ("Excel serial (days since 1899-12-30)", "excel"),
+        ("Split date + time columns", "pair"),
+    ]
+    kind_labels = [label for label, _ in kind_options]
+    kind_lookup = {label: value for label, value in kind_options}
+    layout: list[list[sg.Element]] = [
+        [sg.Text(f"Select the timestamp column for {path.name}")],
+    ]
+    if preview_rows:
+        layout.append(
+            [
+                sg.Table(
+                    values=preview_rows,
+                    headings=headings,
+                    auto_size_columns=True,
+                    display_row_numbers=False,
+                    justification="left",
+                    num_rows=min(len(preview_rows), 10),
+                    key="preview",
+                )
+            ]
+        )
+    else:
+        layout.append([sg.Text("No preview rows available; columns listed below.")])
+    layout.extend(
+        [
+            [
+                sg.Text("Timestamp column"),
+                sg.Combo(
+                    columns,
+                    default_value=columns[0],
+                    readonly=True,
+                    key="column",
+                    size=(40, 1),
+                ),
+            ],
+            [
+                sg.Text("Interpretation"),
+                sg.Combo(
+                    kind_labels,
+                    default_value=kind_labels[0],
+                    readonly=True,
+                    key="kind",
+                    enable_events=True,
+                    size=(45, 1),
+                ),
+            ],
+            [
+                sg.Text("Time column"),
+                sg.Combo(
+                    columns,
+                    readonly=True,
+                    key="time_column",
+                    size=(40, 1),
+                    disabled=True,
+                ),
+            ],
+            [
+                sg.Text("Timezone"),
+                sg.Input(default_tz, key="timezone", disabled=True, size=(30, 1)),
+            ],
+            [
+                sg.Checkbox(
+                    "Remember this choice for files named like this",
+                    default=True,
+                    key="remember",
+                )
+            ],
+            [
+                sg.Button("Apply", key="apply"),
+                sg.Button("Cancel"),
+            ],
+            [
+                sg.Text(
+                    f"Sample saved to {error.sample_path}",
+                    text_color="gray",
+                )
+            ],
+        ]
+    )
+
+    window = sg.Window(
+        "Select timestamp column",
+        layout,
+        modal=True,
+        keep_on_top=True,
+        finalize=True,
+    )
+    try:
+        while True:
+            event, values = window.read()
+            if event in (sg.WIN_CLOSED, "Cancel"):
+                return None, False
+            if event == "kind":
+                label = values.get("kind", kind_labels[0])
+                kind_key = kind_lookup.get(label, "iso")
+                enable_timezone = kind_key in {"local", "pair"}
+                enable_time_column = kind_key == "pair"
+                window["timezone"].update(disabled=not enable_timezone)
+                if not enable_timezone:
+                    window["timezone"].update(default_tz)
+                window["time_column"].update(disabled=not enable_time_column)
+                if not enable_time_column:
+                    window["time_column"].update("")
+            if event == "apply":
+                column = values.get("column")
+                label = values.get("kind", kind_labels[0])
+                kind_key = kind_lookup.get(label, "iso")
+                if not column:
+                    sg.popup_error("Select a timestamp column before continuing.")
+                    continue
+                timezone_value = values.get("timezone") or default_tz
+                time_column = values.get("time_column") or None
+                if kind_key == "pair":
+                    if not time_column or time_column == column:
+                        sg.popup_error("Select a separate time column for the split date/time option.")
+                        continue
+                remember = bool(values.get("remember", False))
+                override = TimestampOverride(
+                    column=str(column),
+                    kind=kind_key,
+                    timezone=timezone_value if kind_key in {"local", "pair"} else None,
+                    time_column=str(time_column) if kind_key == "pair" and time_column else None,
+                )
+                return override, remember
+    finally:
+        window.close()
 
 
 def describe_result(action: str, result: StorageResult) -> str:
@@ -247,6 +411,12 @@ def main() -> None:
             window["log"].update(f"{streamlit_reason}\n", append=True)
         return True
 
+    def resolve_timestamp(path: Path, error: TimestampDetectionError) -> Optional[TimestampOverride]:
+        override, remember = _prompt_timestamp_override(path, error, config)
+        if override and remember:
+            save_timestamp_mapping(path.name, override)
+        return override
+
     while True:
         event, values = window.read(timeout=100)
         if event in (sg.WIN_CLOSED, "Exit"):
@@ -270,6 +440,10 @@ def main() -> None:
                 continue
             end_dt = datetime.now(timezone.utc)
             start_dt = end_dt - timedelta(hours=24)
+            window["log"].update(
+                "Backfill pacing ~1 req/s; duplicates skipped automatically.\n",
+                append=True,
+            )
             try:
                 result = backfill_range(
                     config=config,
@@ -304,6 +478,10 @@ def main() -> None:
             if not prompt:
                 continue
             start_dt, end_dt, window_minutes, limit = prompt
+            window["log"].update(
+                "Backfill pacing ~1 req/s; duplicates skipped automatically.\n",
+                append=True,
+            )
             try:
                 result = backfill_range(
                     config=config,
@@ -345,6 +523,13 @@ def main() -> None:
                     config=config,
                     storage=storage_manager,
                     interactive=True,
+                    resolver=resolve_timestamp,
+                )
+            except TimestampDetectionError as exc:
+                sg.popup_error(
+                    "Offline import canceled.",
+                    f"\n{exc}\n\nSample: {exc.sample_path}",
+                    title="HomeSky import error",
                 )
             except Exception as exc:
                 sg.popup_error(
@@ -353,14 +538,25 @@ def main() -> None:
                     title="HomeSky import error",
                 )
             else:
-                summary = (
-                    f"Imported {report['total_inserted']} rows from {len(paths)} file(s)."
-                )
+                inserted = int(report.get("total_inserted") or 0)
+                duplicates = int(report.get("total_duplicates") or 0)
+                file_count = len(paths)
+                if inserted == 0 and duplicates > 0:
+                    summary = (
+                        f"No new rows; {duplicates:,} duplicate rows already existed across {file_count} file(s)."
+                    )
+                elif inserted == 0:
+                    summary = f"No rows imported from {file_count} file(s)."
+                else:
+                    summary = (
+                        f"Imported {inserted:,} new row{'s' if inserted != 1 else ''} "
+                        f"({duplicates:,} duplicates ignored) from {file_count} file(s)."
+                    )
                 if report.get("time_start") and report.get("time_end"):
                     summary += (
-                        f" Range: {report['time_start']} – {report['time_end']}."
+                        f" Range merged: {report['time_start']} – {report['time_end']}."
                     )
-                summary += f" Report: {report['report_path']}"
+                summary += f" Report saved to {report['report_path']}"
                 window["log"].update(summary + "\n", append=True)
                 data_dir.mkdir(parents=True, exist_ok=True)
                 try:

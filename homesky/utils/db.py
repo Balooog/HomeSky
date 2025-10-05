@@ -5,11 +5,51 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 from loguru import logger
+
+
+def _json_default(value: object) -> Optional[object]:
+    """Return a JSON-serializable representation for database payloads."""
+
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return None
+        ts = value
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return ts.isoformat().replace("+00:00", "Z")
+    if isinstance(value, datetime):
+        ts = value
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        else:
+            ts = ts.astimezone(timezone.utc)
+        return ts.isoformat().replace("+00:00", "Z")
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:  # pragma: no cover - fallback to string
+            pass
+    if hasattr(value, "tolist"):
+        try:
+            return value.tolist()
+        except Exception:  # pragma: no cover - fallback to string
+            pass
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:  # pragma: no cover - fallback to string
+            pass
+    if value is None:
+        return None
+    return str(value)
 
 
 OBS_TABLE_SQL = """
@@ -89,7 +129,7 @@ class DatabaseManager:
                         epoch_ms = int(parsed_epoch.value // 1_000_000)
                         epoch = epoch or int(parsed_epoch.timestamp())
                 payload_source["epoch_ms"] = epoch_ms
-                payload = json.dumps(payload_source)
+                payload = json.dumps(payload_source, default=_json_default)
                 try:
                     cursor.execute(
                         """
@@ -151,13 +191,35 @@ class DatabaseManager:
         if df.empty:
             return df
         expanded = pd.json_normalize(df["data"].apply(json.loads))
-        expanded.index = pd.to_datetime(df["obs_time_utc"], errors="coerce", utc=True)
-        expanded.insert(0, "mac", df["mac"].values)
-        expanded.insert(1, "obs_time_utc", pd.to_datetime(df["obs_time_utc"], errors="coerce", utc=True))
-        expanded.insert(2, "obs_time_local", pd.to_datetime(df["obs_time_local"], errors="coerce"))
-        expanded.insert(3, "epoch", df["epoch"].values)
-        if "epoch_ms" not in expanded.columns:
-            expanded.insert(4, "epoch_ms", df["epoch_ms"].values)
+        epoch_ms_series = pd.to_numeric(df["epoch_ms"], errors="coerce")
+        observed_at = pd.to_datetime(epoch_ms_series, unit="ms", errors="coerce", utc=True)
+        valid_mask = observed_at.notna()
+        if not bool(valid_mask.any()):
+            return expanded.iloc[0:0]
+        expanded = expanded.loc[valid_mask.values].copy()
+        observed_at = observed_at.loc[valid_mask]
+        epoch_ms_int = epoch_ms_series.loc[valid_mask].round().astype("int64")
+        epoch_series = pd.to_numeric(df["epoch"], errors="coerce").loc[valid_mask]
+        obs_time_local = pd.to_datetime(
+            df["obs_time_local"], errors="coerce", utc=True
+        ).loc[valid_mask]
+
+        def _ensure_column(name: str, data: pd.Series, position: int | None = None) -> None:
+            if name in expanded.columns:
+                expanded[name] = data
+            elif position is None:
+                expanded[name] = data
+            else:
+                expanded.insert(position, name, data)
+
+        _ensure_column("mac", df["mac"].loc[valid_mask], position=0)
+        _ensure_column("observed_at", observed_at, position=1)
+        _ensure_column("obs_time_utc", observed_at, position=2)
+        _ensure_column("obs_time_local", obs_time_local, position=3)
+        _ensure_column("epoch", epoch_series, position=4)
+        _ensure_column("epoch_ms", epoch_ms_int, position=5)
+        expanded["epoch_ms"] = expanded["epoch_ms"].astype("int64")
+        expanded.index = observed_at
         return expanded
 
     # -- Parquet helpers ------------------------------------------------
