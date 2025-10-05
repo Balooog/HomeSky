@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 from loguru import logger
 
 import ingest
 from storage import StorageManager
-from utils.timeparse import normalize_columns, to_epoch_ms
+from utils.timeparse import TimestampOverride, normalize_columns, to_epoch_ms
 
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 
@@ -105,26 +107,104 @@ LOCAL_TIME_CANDIDATES = (
 )
 
 
+class TimestampDetectionError(ValueError):
+    """Raised when no valid timestamp column could be inferred."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        path: Optional[Path],
+        columns: List[str],
+        sample_path: Path,
+        preview: pd.DataFrame,
+        rename_map: Dict[str, str],
+        attempted_override: Optional[TimestampOverride] = None,
+    ) -> None:
+        super().__init__(message)
+        self.path = path
+        self.columns = columns
+        self.sample_path = sample_path
+        self.preview = preview
+        self.rename_map = rename_map
+        self.attempted_override = attempted_override
+
+
+TimestampResolver = Callable[[Path, TimestampDetectionError], Optional[TimestampOverride]]
+
+
+def _mapping_store_path() -> Path:
+    if os.name == "nt":
+        appdata = os.getenv("APPDATA")
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    else:
+        cfg_home = os.getenv("XDG_CONFIG_HOME")
+        base = Path(cfg_home) if cfg_home else Path.home() / ".config"
+    return base / "HomeSky" / "import_mappings.json"
+
+
+def load_timestamp_mappings() -> Dict[str, TimestampOverride]:
+    path = _mapping_store_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("[offline] Unable to read timestamp mappings at %s: %s", path, exc)
+        return {}
+    mappings: Dict[str, TimestampOverride] = {}
+    for key, value in payload.items():
+        if not isinstance(value, dict):
+            continue
+        column = value.get("column")
+        kind = value.get("kind")
+        if not column or not kind:
+            continue
+        mappings[key] = TimestampOverride(
+            column=str(column),
+            kind=str(kind),
+            timezone=value.get("timezone"),
+            time_column=value.get("time_column"),
+        )
+    return mappings
+
+
+def save_timestamp_mapping(name: str, override: TimestampOverride) -> Path:
+    path = _mapping_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = json.loads(path.read_text()) if path.exists() else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("[offline] Unable to read existing mappings at %s: %s", path, exc)
+        existing = {}
+    existing[name] = override.as_dict()
+    path.write_text(json.dumps(existing, indent=2))
+    logger.info("[offline] Saved timestamp mapping for %s to %s", name, path)
+    return path
+
+
 def _isoformat_utc(value: object) -> Optional[str]:
     if value is None:
         return None
-    if isinstance(value, (int, float)) and not pd.isna(value):
+    if isinstance(value, pd.Timestamp):
+        ts = value
+    elif isinstance(value, (int, float)) and not pd.isna(value):
         ts = pd.to_datetime(value, unit="ms", utc=True, errors="coerce")
     else:
         ts = pd.to_datetime(value, utc=True, errors="coerce")
     if ts is None or pd.isna(ts):
         return None
-    dt = ts.to_pydatetime()
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+    if not isinstance(ts, pd.Timestamp):
+        ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
     else:
-        dt = dt.astimezone(timezone.utc)
-    epoch_ms = int(dt.timestamp() * 1000)
-    return datetime.utcfromtimestamp(epoch_ms / 1000).isoformat() + "Z"
+        ts = ts.tz_convert("UTC")
+    return ts.isoformat().replace("+00:00", "Z")
 
 
 def _epoch_to_iso(epoch_ms: int) -> str:
-    return datetime.utcfromtimestamp(epoch_ms / 1000).isoformat() + "Z"
+    return datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _normalize_name(value: object) -> str:
@@ -260,18 +340,38 @@ def _write_error_sample(config: Dict, raw: pd.DataFrame) -> Path:
     return sample_path
 
 
-def _raise_timestamp_error(raw: pd.DataFrame, config: Dict) -> None:
+def _raise_timestamp_error(
+    *,
+    raw: pd.DataFrame,
+    config: Dict,
+    rename_map: Dict[str, str],
+    source_path: Path,
+    override: Optional[TimestampOverride],
+) -> None:
     sample_path = _write_error_sample(config, raw)
-    columns = ", ".join(str(col).strip() for col in raw.columns if str(col).strip())
-    columns = columns or "(none)"
-    logger.warning("[offline] No valid timestamps found. Columns detected: %s", columns)
-    message = (
-        f"{TIMESTAMP_ERROR_MESSAGE}\n\n"
-        "Examples:\n- dateutc\n- epoch\n- date + time\n\n"
-        f"Columns detected: {columns}\n"
-        f"Sample saved to {sample_path.resolve()}"
+    columns = [str(col).strip() for col in raw.columns if str(col).strip()]
+    columns_display = ", ".join(columns) if columns else "(none)"
+    logger.warning("[offline] No valid timestamps found. Columns detected: %s", columns_display)
+    message_lines = [f"File: {source_path.name}", TIMESTAMP_ERROR_MESSAGE, "", "Examples:", "- dateutc", "- epoch", "- date + time", ""]
+    message_lines.append(f"Columns detected: {columns_display}")
+    message_lines.append(f"Sample saved to {sample_path.resolve()}")
+    if override is not None:
+        message_lines.append(
+            "Override attempted: "
+            f"column={override.column!r} kind={override.kind}"
+            + (f" time_column={override.time_column!r}" if override.time_column else "")
+        )
+    message = "\n".join(message_lines)
+    preview = raw.head(10).copy()
+    raise TimestampDetectionError(
+        message,
+        path=source_path,
+        columns=columns,
+        sample_path=sample_path,
+        preview=preview,
+        rename_map=rename_map,
+        attempted_override=override,
     )
-    raise ValueError(message)
 
 
 def _prepare_dataframe(
@@ -279,17 +379,47 @@ def _prepare_dataframe(
     *,
     mac_hint: Optional[str],
     config: Dict,
-    interactive: bool,
+    tz_hint: str,
+    source_path: Path,
+    override: Optional[TimestampOverride],
 ) -> Tuple[pd.DataFrame, List[str]]:
     working = raw.copy()
-    normalize_columns(working)
+    rename_map = normalize_columns(working)
     _apply_header_aliases(working)
+
+    normalized_override: Optional[TimestampOverride] = None
+    if override is not None:
+        normalized_override = TimestampOverride(
+            column=rename_map.get(override.column, override.column),
+            kind=override.kind,
+            timezone=override.timezone,
+            time_column=rename_map.get(override.time_column, override.time_column)
+            if override.time_column
+            else None,
+        )
+
     try:
-        epoch_ms_series = to_epoch_ms(working)
+        epoch_ms_series = to_epoch_ms(
+            working,
+            tz_hint=tz_hint,
+            override=normalized_override,
+        )
     except ValueError:
-        _raise_timestamp_error(raw, config)
+        _raise_timestamp_error(
+            raw=raw,
+            config=config,
+            rename_map=rename_map,
+            source_path=source_path,
+            override=override,
+        )
     if epoch_ms_series.empty:
-        _raise_timestamp_error(raw, config)
+        _raise_timestamp_error(
+            raw=raw,
+            config=config,
+            rename_map=rename_map,
+            source_path=source_path,
+            override=override,
+        )
 
     valid = working.loc[epoch_ms_series.index].copy()
     _apply_header_aliases(valid)
@@ -319,6 +449,13 @@ def _prepare_dataframe(
     columns_used = epoch_ms_series.attrs.get("columns") or []
     if columns_used:
         details.append(f"Using columns: {', '.join(columns_used)}")
+    if override is not None:
+        override_desc = f"Override applied: {override.column} ({override.kind})"
+        if override.time_column:
+            override_desc += f" + {override.time_column}"
+        if override.timezone:
+            override_desc += f" [{override.timezone}]"
+        details.append(override_desc)
     for line in details:
         logger.debug("[offline] %s", line)
 
@@ -339,7 +476,7 @@ def _prepare_dataframe(
     if local_series is not None:
         valid["timestamp_local"] = local_series
     else:
-        tz_name = str(config.get("timezone", {}).get("local_tz") or "UTC")
+        tz_name = str(config.get("timezone", {}).get("local_tz") or tz_hint or "UTC")
         try:
             valid["timestamp_local"] = observed_at.dt.tz_convert(tz_name)
         except Exception as exc:  # pragma: no cover - timezone fallback
@@ -366,8 +503,15 @@ def import_files(
     config: Dict,
     storage: StorageManager,
     interactive: bool = False,
+    overrides: Optional[Dict[str, TimestampOverride]] = None,
+    resolver: Optional[TimestampResolver] = None,
 ) -> Dict:
     mac = config.get("ambient", {}).get("mac")
+    tz_hint = str(config.get("timezone", {}).get("local_tz") or "UTC")
+    if overrides is None:
+        override_map = load_timestamp_mappings()
+    else:
+        override_map = dict(overrides)
     summaries: List[Dict] = []
     total_inserted = 0
     total_rows = 0
@@ -381,17 +525,29 @@ def import_files(
             df = _read_table(path)
         except Exception as exc:
             raise RuntimeError(f"{path.name}: {exc}") from exc
-        try:
-            prepared, timestamp_details = _prepare_dataframe(
-                df,
-                mac_hint=mac,
-                config=config,
-                interactive=interactive,
-            )
-        except ValueError as exc:
-            raise ValueError(f"{path.name}: {exc}") from exc
-        except RuntimeError as exc:
-            raise RuntimeError(f"{path.name}: {exc}") from exc
+        override = override_map.get(path.name) or override_map.get(str(path))
+        while True:
+            try:
+                prepared, timestamp_details = _prepare_dataframe(
+                    df,
+                    mac_hint=mac,
+                    config=config,
+                    tz_hint=tz_hint,
+                    source_path=path,
+                    override=override,
+                )
+            except TimestampDetectionError as exc:
+                if interactive and resolver is not None:
+                    resolution = resolver(path, exc)
+                    if resolution is None:
+                        raise
+                    override = resolution
+                    override_map[path.name] = resolution
+                    continue
+                raise
+            except RuntimeError as exc:
+                raise RuntimeError(f"{path.name}: {exc}") from exc
+            break
         total_rows += len(df)
         if prepared.empty:
             summaries.append(
@@ -476,3 +632,13 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+__all__ = [
+    "TimestampDetectionError",
+    "TimestampResolver",
+    "TimestampOverride",
+    "import_files",
+    "load_timestamp_mappings",
+    "save_timestamp_mapping",
+]
