@@ -57,7 +57,7 @@ class AmbientClient:
                     raise
                 sleep_for = self.backoff * attempt
                 logger.warning(
-                    "Ambient API request failed (attempt %s/%s): %s; retrying in %.1fs",
+                    "Ambient API request failed (attempt {}/{}): {}; retrying in {:.1f}s",
                     attempt,
                     self.retries,
                     exc,
@@ -73,7 +73,7 @@ class AmbientClient:
             raise AmbientAPIError("Unexpected devices payload")
         if self.mac:
             devices = [device for device in devices if device.get("macAddress") == self.mac]
-        logger.debug("Fetched %d devices from Ambient Weather", len(devices))
+        logger.debug("Fetched {} devices from Ambient Weather", len(devices))
         return devices
 
     def get_device_data(self, limit: int = 288) -> List[Dict[str, Any]]:
@@ -83,7 +83,7 @@ class AmbientClient:
         data = self._request("devices", params=params)
         if not isinstance(data, list):
             raise AmbientAPIError("Unexpected observations payload")
-        logger.debug("Fetched %d observation rows", len(data))
+        logger.debug("Fetched {} observation rows", len(data))
         return data
 
 
