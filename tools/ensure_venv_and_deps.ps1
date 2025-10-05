@@ -31,6 +31,7 @@ if ($current -ne $prior) {
   Set-Content -Path $hashFile -Value $current -Encoding UTF8
 } else {
   Write-Host "[deps] requirements unchanged -> skipping installs." -ForegroundColor Green
+  Write-Host "[deps] If you hit missing module errors, run: pip install -r requirements.txt --extra-index-url $ExtraIndex" -ForegroundColor DarkYellow
 }
 
 # Return the venv activated in the caller shell

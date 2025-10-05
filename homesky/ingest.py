@@ -29,8 +29,20 @@ def load_config(path: Path | None = None) -> Dict:
         candidates = candidate_config_paths()
     for candidate in candidates:
         if candidate.exists():
-            with candidate.open("rb") as fh:
-                return tomllib.load(fh)
+            try:
+                with candidate.open("rb") as fh:
+                    config = tomllib.load(fh)
+            except tomllib.TOMLDecodeError as exc:
+                logger.error("Failed to parse config at {}: {}", candidate, exc)
+                logger.info(
+                    "Open the file in a text editor, ensure it starts with [ambient] on the first line, and save it as UTF-8 without a BOM."
+                )
+                logger.info(
+                    "To recreate a clean template, rename the broken file then run tools/ensure_config.ps1 or copy homesky/config.example.toml manually."
+                )
+                raise
+            print("[config] Loaded successfully")
+            return config
     raise FileNotFoundError(
         "config.toml not found. Run tools/ensure_config.ps1 or copy homesky/config.example.toml to homesky/config.toml and populate your credentials."
     )
