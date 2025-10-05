@@ -9,12 +9,12 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
+import altair as alt
 import pandas as pd
 from pandas.api import types as ptypes
 import streamlit as st
 
 import ingest
-from utils.charts import build_metric_chart, prepare_timeseries
 from utils.derived import compute_all_derived
 from utils.theming import get_theme, load_typography
 
@@ -60,6 +60,18 @@ def _get_zone(tz_name: str) -> ZoneInfo:
         return ZoneInfo(tz_name)
     except Exception:  # pragma: no cover - fallback to UTC
         return ZoneInfo("UTC")
+
+
+def _safe_localize_day(value: pd.Timestamp | str, zone: ZoneInfo) -> pd.Timestamp:
+    """Return a timezone-aware timestamp for the start of *value*'s day."""
+
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert(zone)
+        return ts.normalize()
+
+    ts = ts.normalize()
+    return ts.tz_localize(zone, ambiguous=False, nonexistent="shift_forward")
 
 
 def _format_timestamp(ts: Optional[pd.Timestamp], tz_name: str) -> str:
@@ -165,7 +177,9 @@ def _prepare_time_columns(df: pd.DataFrame, tz_name: str) -> pd.DataFrame:
     if local_candidates is not None:
         if getattr(local_candidates.dtype, "tz", None) is None:
             try:
-                local_series = local_candidates.dt.tz_localize(zone, ambiguous="infer", nonexistent="shift_forward")
+                local_series = local_candidates.dt.tz_localize(
+                    zone, ambiguous=False, nonexistent="shift_forward"
+                )
             except Exception:
                 local_series = working["s_time_utc"].dt.tz_convert(zone)
         else:
@@ -264,7 +278,9 @@ def sanitize_for_arrow(
         local_series = pd.to_datetime(df.index, errors="coerce")
     if getattr(local_series.dtype, "tz", None) is None:
         try:
-            local_series = local_series.dt.tz_localize(zone, ambiguous="infer", nonexistent="shift_forward")
+            local_series = local_series.dt.tz_localize(
+                zone, ambiguous=False, nonexistent="shift_forward"
+            )
         except Exception:
             local_series = local_series.dt.tz_localize(zone, nonexistent="shift_forward")
     else:
@@ -326,6 +342,77 @@ def _compute_rainfall(window: pd.DataFrame) -> Tuple[float, Optional[str]]:
     else:
         rainfall = _rain_24h(window[rain_column])
     return rainfall, rain_column
+
+
+def _metric_series(
+    df: pd.DataFrame,
+    metric_key: str,
+    zone: ZoneInfo,
+    rule: Optional[str],
+    agg: str,
+) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=[metric_key])
+
+    working = df.copy()
+    if "s_time_local" in working.columns:
+        index = pd.to_datetime(working["s_time_local"], errors="coerce")
+    else:
+        index = pd.to_datetime(working.index, errors="coerce")
+
+    index = pd.DatetimeIndex(index)
+    if index.tz is None:
+        index = index.tz_localize(zone, ambiguous=False, nonexistent="shift_forward")
+    else:
+        index = index.tz_convert(zone)
+
+    working = working.assign(s_time_local=index).set_index("s_time_local")
+
+    aliases = {
+        "tempf": "temp_f",
+        "dewpoint_f": "dew_point_f",
+        "winddir": "wind_dir_deg",
+        "windspeed_mph": "wind_speed_mph",
+        "gust_mph": "wind_gust_mph",
+        "rain_rate_in_hr": "rain_rate_in_hr",
+    }
+    column = aliases.get(metric_key, metric_key)
+    if column not in working.columns:
+        return pd.DataFrame(columns=[column])
+
+    working[column] = pd.to_numeric(working[column], errors="coerce")
+
+    agg = (agg or "mean").lower()
+    if rule:
+        resampler = working[column].resample(rule)
+        if agg == "last":
+            working = resampler.last().to_frame(name=column)
+        elif agg == "sum":
+            working = resampler.sum(min_count=1).to_frame(name=column)
+        elif hasattr(resampler, agg):
+            working = getattr(resampler, agg)().to_frame(name=column)
+        else:
+            working = resampler.mean().to_frame(name=column)
+    else:
+        working = working[[column]]
+
+    working = working.dropna(how="all")
+    working.index.name = "s_time_local"
+    return working
+
+
+@st.cache_data(show_spinner=False)
+def _metric_series_cached(
+    cache_key: str,
+    df: pd.DataFrame,
+    metric_key: str,
+    tz_name: str,
+    rule: Optional[str],
+    agg: str,
+) -> pd.DataFrame:
+    del cache_key
+    zone = _get_zone(tz_name)
+    return _metric_series(df, metric_key, zone, rule, agg)
 
 
 def main() -> None:
@@ -463,82 +550,85 @@ def main() -> None:
         start_date, end_date = end_date, start_date
 
     zone = _get_zone(tz_name)
-    start_ts = pd.Timestamp(start_date).tz_localize(zone, ambiguous="infer", nonexistent="shift_forward")
-    end_ts = pd.Timestamp(end_date).tz_localize(zone, ambiguous="infer", nonexistent="shift_forward") + timedelta(days=1)
-    start_ts = max(start_ts, min_ts)
-    end_ts = min(end_ts, max_ts + timedelta(seconds=1))
+    requested_start = _safe_localize_day(start_date, zone)
+    requested_end = _safe_localize_day(end_date, zone) + timedelta(days=1) - timedelta(milliseconds=1)
+
+    if requested_start > max_ts:
+        st.warning("Selected window is in the future; no points yet.")
+        st.toast("Selected window has no data points.")
+        st.stop()
+    if requested_end < min_ts:
+        st.warning("Selected window is before available data.")
+        st.toast("Selected window has no data points.")
+        st.stop()
+
+    start_ts = max(requested_start, min_ts)
+    end_ts = min(requested_end, max_ts)
 
     mask = (df.index >= start_ts) & (df.index <= end_ts)
     filtered = df.loc[mask].copy()
 
     if filtered.empty:
-        st.warning("No data available for the selected range/metric.")
+        st.toast("No data points in the chosen range.")
+        st.info("No data available for the selected range/metric.")
         st.stop()
 
-    chart_source = filtered.set_index("s_time_local")
-    prepared = prepare_timeseries(chart_source, metric_column, resample_value, aggregate)
+    chart_cache_key = "|".join(
+        [
+            metric_column,
+            resample_value or "raw",
+            aggregate.lower(),
+            start_ts.isoformat(),
+            end_ts.isoformat(),
+        ]
+    )
+    prepared = _metric_series_cached(
+        chart_cache_key,
+        filtered,
+        metric_column,
+        tz_name,
+        resample_value,
+        aggregate,
+    )
 
     if prepared.empty:
-        st.warning("No data available after applying resample/aggregate.")
+        st.toast("No data points after resampling/aggregation.")
+        st.info("No data available after applying resample/aggregate.")
         st.stop()
 
-    last_24h_start = filtered.index.max() - timedelta(hours=24)
-    window_24h = filtered[filtered.index >= last_24h_start]
+    column_name = prepared.columns[0]
+    stats_series = prepared[column_name]
 
-    temp_column = _resolve_column(filtered, "temp_f", "tempf", "temperature")
-    current_temp = _format_temperature(_latest_numeric(filtered[temp_column])) if temp_column else "n/a"
-    high_24h = _format_temperature(float(pd.to_numeric(window_24h[temp_column], errors="coerce").max())) if temp_column else "n/a"
-    low_24h = _format_temperature(float(pd.to_numeric(window_24h[temp_column], errors="coerce").min())) if temp_column else "n/a"
+    def _format_stat(value: float) -> str:
+        return "n/a" if pd.isna(value) else f"{value:.2f}"
 
-    rain_total, rain_column = _compute_rainfall(window_24h)
+    rain_total, rain_column = _compute_rainfall(filtered)
     rain_display = _format_inches(rain_total)
 
-    wind_speed_column = _resolve_column(filtered, "wind_speed_mph", "windspeedmph")
-    wind_gust_column = _resolve_column(filtered, "wind_gust_mph", "windgustmph")
-    wind_dir_column = _resolve_column(filtered, "wind_dir_deg", "winddir")
-    wind_speed = _format_speed(_latest_numeric(filtered[wind_speed_column])) if wind_speed_column else "n/a"
-    gust_value = _latest_numeric(filtered[wind_gust_column]) if wind_gust_column else float("nan")
-    wind_gust = _format_speed(gust_value)
-    wind_dir = _direction_to_cardinal(_latest_numeric(filtered[wind_dir_column])) if wind_dir_column else None
-    wind_delta_parts = []
-    if wind_gust != "n/a":
-        wind_delta_parts.append(f"Gust {wind_gust}")
-    if wind_dir:
-        wind_delta_parts.append(wind_dir)
-    wind_delta = " • ".join(wind_delta_parts) if wind_delta_parts else ""
+    stats_cols = st.columns(5)
+    stats_cols[0].metric("Min", _format_stat(stats_series.min()))
+    stats_cols[1].metric("Mean", _format_stat(stats_series.mean()))
+    stats_cols[2].metric("Max", _format_stat(stats_series.max()))
+    stats_cols[3].metric("Rain Total", rain_display, delta=rain_column or None)
+    stats_cols[4].metric("Last Observation", _format_timestamp(filtered.index.max(), tz_name))
 
-    station_ids = (
-        filtered.get("mac").dropna().astype("string").unique().tolist()
-        if "mac" in filtered.columns
-        else []
+    chart = (
+        alt.Chart(prepared.reset_index())
+        .mark_line(point=False)
+        .encode(
+            x=alt.X("s_time_local:T", title=f"Time ({tz_name})"),
+            y=alt.Y(f"{column_name}:Q", title=metric_label, scale=alt.Scale(zero=False, nice=True)),
+            tooltip=[
+                alt.Tooltip("s_time_local:T", title="Time"),
+                alt.Tooltip(f"{column_name}:Q", title=metric_label),
+            ],
+        )
+        .properties(height=320)
+        .interactive()
     )
-    if not station_ids:
-        source_label = ""
-    elif len(station_ids) <= 2:
-        source_label = ", ".join(station_ids)
-    else:
-        source_label = ", ".join(station_ids[:2]) + "…"
+    st.altair_chart(chart, use_container_width=True)
 
-    kpi_cols = st.columns(6)
-    kpi_cols[0].metric("Outdoor Temp", current_temp)
-    kpi_cols[1].metric("24h High", high_24h)
-    kpi_cols[2].metric("24h Low", low_24h)
-    kpi_cols[3].metric("Rain (24h)", rain_display, delta=rain_column or "")
-    kpi_cols[4].metric("Wind", wind_speed, delta=wind_delta or None)
-    kpi_cols[5].metric("Last Update", _format_timestamp(filtered.index.max(), tz_name), delta=source_label or None)
-
-    st.altair_chart(
-        build_metric_chart(
-            prepared,
-            metric_column,
-            theme,
-            title=metric_label,
-            timezone_label=tz_name,
-        ),
-        use_container_width=True,
-    )
-
-    explorer_df = prepared if resample_value else filtered[[c for c in filtered.columns if c != "raw"]]
+    explorer_df = prepared
     st.subheader("Data Explorer")
     display_df = explorer_df.reset_index()
     st.dataframe(display_df, use_container_width=True)
@@ -551,17 +641,9 @@ def main() -> None:
         mime="text/csv",
     )
 
-    value_columns = {metric_column}
-    if temp_column:
-        value_columns.add(temp_column)
+    value_columns = {column_name}
     if rain_column:
         value_columns.add(rain_column)
-    if wind_speed_column:
-        value_columns.add(wind_speed_column)
-    if wind_gust_column:
-        value_columns.add(wind_gust_column)
-    if wind_dir_column:
-        value_columns.add(wind_dir_column)
 
     sanitized = sanitize_for_arrow(filtered, tz_name=tz_name, value_columns=value_columns)
     parquet_buffer = BytesIO()
