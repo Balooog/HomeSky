@@ -73,9 +73,12 @@ def should_launch_streamlit(config: dict) -> tuple[bool, str]:
     return True, ""
 
 
-def run_streamlit() -> subprocess.Popen | None:
+def run_streamlit(port: int | None = None) -> subprocess.Popen | None:
     try:
-        return subprocess.Popen(["streamlit", "run", str(STREAMLIT_ENTRY)])
+        command = ["streamlit", "run", str(STREAMLIT_ENTRY)]
+        if port:
+            command.extend(["--server.port", str(port)])
+        return subprocess.Popen(command)
     except FileNotFoundError:
         return None
 
@@ -141,6 +144,7 @@ def main() -> None:
     layout = [
         [sg.Text("HomeSky Control", font=("Inter", 16))],
         [sg.Button("Fetch Now", key="fetch", size=(20, 1))],
+        [sg.Button("Backfill (24h)", key="backfill24", size=(20, 1))],
         [
             sg.Button(
                 "Open Dashboard",
@@ -176,11 +180,52 @@ def main() -> None:
                 window["log"].update(f"Fetched {inserted} new rows\n", append=True)
             except Exception as exc:  # pragma: no cover
                 window["log"].update(f"Error: {exc}\n", append=True)
+        elif event == "backfill24":
+            try:
+                config = ingest.load_config()
+                added = ingest.backfill(config, hours=24, db=db)
+            except Exception as exc:
+                sg.popup_error(
+                    "Backfill failed.",
+                    f"\nDetails: {exc}\n",
+                    title="HomeSky backfill error",
+                )
+            else:
+                message = (
+                    f"Backfill added {added} rows\n"
+                    if added
+                    else "Backfill complete; no new rows\n"
+                )
+                window["log"].update(message, append=True)
         elif event == "dashboard":
             if dashboard_process and dashboard_process.poll() is None:
                 window["log"].update("Dashboard already running\n", append=True)
             else:
-                dashboard_process = run_streamlit()
+                try:
+                    config = ingest.load_config()
+                except Exception as exc:
+                    sg.popup_error(
+                        "Streamlit could not start because the configuration could not be loaded.",
+                        f"\nDetails: {exc}\n",
+                        title="HomeSky dashboard error",
+                    )
+                    continue
+                streamlit_allowed, streamlit_reason = should_launch_streamlit(config)
+                if not streamlit_allowed:
+                    if streamlit_reason:
+                        window["log"].update(f"{streamlit_reason}\n", append=True)
+                    continue
+                port_value = config.get("ui", {}).get("dashboard_port")
+                port_int: int | None = None
+                if port_value:
+                    try:
+                        port_int = int(port_value)
+                    except (TypeError, ValueError):
+                        window["log"].update(
+                            "Invalid dashboard_port value; launching Streamlit with default port.\n",
+                            append=True,
+                        )
+                dashboard_process = run_streamlit(port=port_int)
                 if dashboard_process is None:
                     window["log"].update(
                         "Streamlit CLI not found. Install streamlit in the active environment to enable the dashboard.\n",

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 from loguru import logger
@@ -104,3 +105,117 @@ def fetch_latest_observations(
 
     client = AmbientClient(api_key=api_key, application_key=app_key, mac=mac)
     return client.get_device_data(limit=limit)
+
+
+def _parse_dateutc(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value) / 1000.0, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            numeric = float(text)
+        except ValueError:
+            numeric = None
+        if numeric is not None:
+            try:
+                return datetime.fromtimestamp(numeric / 1000.0, tz=timezone.utc)
+            except (OSError, OverflowError, ValueError):
+                pass
+        iso_candidate = text
+        if iso_candidate.endswith("Z"):
+            iso_candidate = iso_candidate[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(iso_candidate)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
+            try:
+                dt = datetime.strptime(text, fmt)
+                return dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
+def fetch_history(
+    api_key: str,
+    app_key: str,
+    mac: str | None,
+    *,
+    hours: int = 24,
+    tz: str = "America/New_York",
+    page_size: int = 288,
+) -> List[Dict[str, Any]]:
+    """Fetch historical observations spanning ``hours`` back from now."""
+
+    if hours <= 0:
+        return []
+    if not mac:
+        raise ValueError("A device MAC address is required to fetch history")
+
+    end_cursor = datetime.now(timezone.utc)
+    target_start = end_cursor - timedelta(hours=hours)
+    seen: Set[Tuple[str, str]] = set()
+    results: List[Dict[str, Any]] = []
+
+    with requests.Session() as session:
+        while True:
+            remaining_hours = max(
+                1.0, (end_cursor - target_start).total_seconds() / 3600.0
+            )
+            approx_samples = max(1, int(remaining_hours * 12))
+            limit = max(1, min(page_size, approx_samples))
+            params = {
+                "apiKey": api_key,
+                "applicationKey": app_key,
+                "limit": limit,
+                "endDate": end_cursor.strftime("%Y-%m-%d %H:%M:%S"),
+                "tz": tz,
+            }
+            response = session.get(f"{BASE_URL}/devices/{mac}", params=params, timeout=30)
+            if response.status_code >= 400:
+                raise AmbientAPIError(
+                    f"Ambient API error {response.status_code}: {response.text}"
+                )
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise AmbientAPIError("Unexpected history payload")
+            if not payload:
+                break
+
+            oldest_dt: Optional[datetime] = None
+            unique_batch: List[Dict[str, Any]] = []
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                dt = _parse_dateutc(item.get("dateutc"))
+                if dt and (oldest_dt is None or dt < oldest_dt):
+                    oldest_dt = dt
+                key = (str(item.get("dateutc")), str(item.get("macAddress") or mac))
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_batch.append(item)
+
+            results.extend(unique_batch)
+
+            if not oldest_dt:
+                break
+            if oldest_dt <= target_start:
+                break
+            if oldest_dt >= end_cursor:
+                break
+
+            end_cursor = oldest_dt - timedelta(seconds=1)
+
+    return results

@@ -3,53 +3,71 @@
 from __future__ import annotations
 
 from io import BytesIO
-from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 
 import pandas as pd
 from pandas.api import types as ptypes
 import streamlit as st
 
+import ingest
 from utils.charts import build_metric_chart, describe_metric, prepare_timeseries
-from utils.db import DatabaseManager
 from utils.derived import compute_all_derived
 from utils.theming import get_theme, load_typography
-
-try:
-    import tomllib
-except ImportError:  # pragma: no cover
-    import tomli as tomllib  # type: ignore
-
-CONFIG_PATH = Path("config.toml")
-
-
-@st.cache_data(ttl=60)
-def load_config(path: Path = CONFIG_PATH) -> Dict:
-    with path.open("rb") as fh:
-        return tomllib.load(fh)
 
 
 @st.cache_data(ttl=60)
 def load_data(sqlite_path: str, parquet_path: str) -> pd.DataFrame:
-    db = DatabaseManager(Path(sqlite_path), Path(parquet_path))
-    df = db.read_dataframe()
-    return df
+    storage_config: Dict[str, Dict[str, str]] = {
+        "storage": {
+            "sqlite_path": sqlite_path,
+            "parquet_path": parquet_path,
+        }
+    }
+    return ingest.load_dataset(storage_config)
+
+
+def _ensure_logging(config: Dict) -> None:
+    if st.session_state.get("_homesky_logging_configured"):
+        return
+    ingest.setup_logging(config)
+    st.session_state["_homesky_logging_configured"] = True
 
 
 def main() -> None:
     st.set_page_config(page_title="HomeSky", layout="wide")
     try:
-        config = load_config()
-    except FileNotFoundError:
-        st.error("Missing config.toml. Copy config.example.toml and update your credentials.")
+        config = ingest.load_config()
+    except FileNotFoundError as exc:
+        st.error(
+            "HomeSky configuration not found. The dashboard now uses the same loader as the GUI."
+        )
+        st.info(
+            "Ensure a valid config exists at %APPDATA%\\HomeSky\\config.toml or run"
+            " tools/ensure_config.ps1 to generate one."
+        )
+        st.exception(exc)
         st.stop()
+    except Exception as exc:  # pragma: no cover - defensive guard for UI feedback
+        st.error("Unable to load HomeSky configuration.")
+        st.exception(exc)
+        st.stop()
+
+    _ensure_logging(config)
 
     theme_choice = config.get("visualization", {}).get("theme", "dark")
     theme = get_theme(theme_choice)
     typography = load_typography()
 
     storage_cfg = config.get("storage", {})
-    df = load_data(storage_cfg.get("sqlite_path", "./data/homesky.sqlite"), storage_cfg.get("parquet_path", "./data/homesky.parquet"))
+    try:
+        df = load_data(
+            storage_cfg.get("sqlite_path", "./data/homesky.sqlite"),
+            storage_cfg.get("parquet_path", "./data/homesky.parquet"),
+        )
+    except Exception as exc:  # pragma: no cover - surfaced via Streamlit UI
+        st.error("Unable to load stored observations.")
+        st.exception(exc)
+        st.stop()
 
     if df.empty:
         st.info("No observations stored yet. Run ingest.py to begin capturing data.")

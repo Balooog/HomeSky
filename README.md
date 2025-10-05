@@ -50,9 +50,9 @@ python .\homesky\gui.py
   launch_streamlit = true
   dashboard_port = 8501
   ```
-- **Fetching more history** – The current build ingests incremental updates as they arrive. A dedicated backfill command
-  (to load large historical windows) is planned for a follow-up release, so there is no need to delete the existing
-  database to "force" older data.
+- **Fetching more history** – Click **Backfill (24h)** in the GUI to pull a full day of history on demand. The ingest
+  service also backfills automatically on the first run using the `[ingest].backfill_hours` setting in `config.toml`, so
+  there is no need to delete the existing database to "force" older data.
 
 ### Known-good config template
 
@@ -88,3 +88,5 @@ python -m PyInstaller --onefile --clean --name HomeSky --distpath dist homesky\g
 
 Write-Host "# Test Build Complete" -ForegroundColor Green
 ```
+
+# Test Build Complete
