@@ -12,6 +12,7 @@ import pandas as pd
 from loguru import logger
 
 from utils.ambient import AmbientClient
+from utils.config import candidate_config_paths
 from utils.db import DatabaseManager
 from utils.derived import compute_all_derived
 
@@ -21,13 +22,13 @@ except ImportError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
 
-CONFIG_PATHS = [Path("config.toml"), Path("homesky/config.toml")]
-
-
 def load_config(path: Path | None = None) -> Dict:
-    candidates = [path] if path else CONFIG_PATHS
+    if path:
+        candidates = [path]
+    else:
+        candidates = candidate_config_paths()
     for candidate in candidates:
-        if candidate and candidate.exists():
+        if candidate.exists():
             with candidate.open("rb") as fh:
                 return tomllib.load(fh)
     raise FileNotFoundError(
