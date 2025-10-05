@@ -50,17 +50,6 @@ sqlite_path = "./data/homesky.sqlite"
 parquet_path = "./data/homesky.parquet"
 ```
 
-If you run into missing Python packages later, rerun:
-
-```pwsh
-pip install -r requirements.txt --extra-index-url https://PySimpleGUI.net/install
-```
-
-### Configure
-- Edit `homesky/config.toml` with Ambient Weather credentials.
-- Optional: set `[ui] launch_streamlit = true` only when `homesky/visualize_streamlit.py` exists.
-- Rerun: `python .\homesky\gui.py`
-
 ### Build EXE (when packaging)
 
 ```pwsh
