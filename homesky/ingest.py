@@ -6,13 +6,13 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import pandas as pd
 from loguru import logger
 
 from utils.ambient import AmbientClient
-from utils.config import candidate_config_paths
+from utils.config import candidate_config_paths, ensure_parent_directory, external_config_path
 from utils.db import DatabaseManager
 from utils.derived import compute_all_derived
 
@@ -22,30 +22,194 @@ except ImportError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
 
-def load_config(path: Path | None = None) -> Dict:
-    if path:
-        candidates = [path]
-    else:
-        candidates = candidate_config_paths()
-    for candidate in candidates:
+CONFIG_TEMPLATE_PATH = Path(__file__).resolve().parent / "config.example.toml"
+FALLBACK_TEMPLATE = """
+[ambient]
+api_key = ""
+application_key = ""
+mac = ""
+
+[storage]
+root_dir = "./data"
+sqlite_path = "./data/homesky.sqlite"
+parquet_path = "./data/homesky.parquet"
+"""
+
+
+def _split_comment(segment: str) -> Tuple[str, str]:
+    in_string = False
+    quote_char = ""
+    for idx, char in enumerate(segment):
+        if char in {'"', "'"}:
+            if not in_string:
+                in_string = True
+                quote_char = char
+            elif quote_char == char:
+                in_string = False
+        elif char == "#" and not in_string:
+            prefix = segment[:idx]
+            suffix = segment[idx:]
+            trimmed = prefix.rstrip()
+            whitespace = prefix[len(trimmed) :]
+            return trimmed, f"{whitespace}{suffix}"
+    return segment.rstrip(), ""
+
+
+def _needs_quoting(value: str) -> bool:
+    if not value:
+        return False
+    if value[0] in {'"', "'", "[", "{"}:
+        return False
+    lowered = value.lower()
+    if lowered in {"true", "false"}:
+        return False
+    try:
+        tomllib.loads(f"value = {value}")
+        return False
+    except tomllib.TOMLDecodeError:
+        return True
+
+
+def _auto_quote_line(line: str) -> Tuple[str, bool]:
+    stripped = line.lstrip()
+    if not stripped or stripped.startswith("#") or stripped.startswith("["):
+        return line, False
+    if "=" not in line:
+        return line, False
+    left, right = line.split("=", 1)
+    value_segment, comment = _split_comment(right)
+    value = value_segment.strip()
+    if not _needs_quoting(value):
+        return line, False
+    quoted = f'"{value}"'
+    new_line = f"{left.rstrip()} = {quoted}"
+    if comment:
+        new_line += comment
+    return new_line, True
+
+
+def _normalize_config_bytes(raw: bytes) -> Tuple[str, bool]:
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise
+    leading_stripped = text.lstrip("\ufeff\r\n\t ")
+    changed = leading_stripped != text or raw.startswith(b"\xef\xbb\xbf")
+    text = leading_stripped
+    lines = text.splitlines()
+    quoted_lines: List[str] = []
+    quoting_changed = False
+    for line in lines:
+        new_line, line_changed = _auto_quote_line(line)
+        quoted_lines.append(new_line)
+        if line_changed:
+            quoting_changed = True
+    normalized = "\n".join(quoted_lines)
+    if text.endswith(("\r", "\n")):
+        normalized += "\n"
+    return normalized, changed or quoting_changed
+
+
+def _template_text() -> str:
+    if CONFIG_TEMPLATE_PATH.exists():
+        return CONFIG_TEMPLATE_PATH.read_text(encoding="utf-8")
+    return FALLBACK_TEMPLATE.strip() + "\n"
+
+
+def _backup_and_restore(candidate: Path) -> None:
+    backup_path = candidate.with_name("config.bak")
+    ensure_parent_directory(backup_path)
+    try:
         if candidate.exists():
+            backup_path.write_bytes(candidate.read_bytes())
+            logger.warning("Existing config backed up to {}", backup_path)
+    except OSError as exc:
+        logger.warning("Unable to write backup config at {}: {}", backup_path, exc)
+    try:
+        ensure_parent_directory(candidate)
+        candidate.write_text(_template_text(), encoding="utf-8")
+    except OSError as exc:
+        logger.error("Failed to write fresh config template at {}: {}", candidate, exc)
+        raise
+
+
+def load_config(path: Path | None = None) -> Dict:
+    load_config.last_path = None
+    load_config.last_was_repaired = False
+    load_config.last_was_normalized = False
+    candidates = [path] if path else candidate_config_paths()
+    preferred_external = external_config_path()
+    last_error: Exception | None = None
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            is_external = candidate.resolve() == preferred_external.resolve()
+        except OSError:
+            is_external = candidate == preferred_external
+        attempts = 0
+        repaired_candidate = False
+        normalized_any = False
+        while True:
+            attempts += 1
             try:
-                with candidate.open("rb") as fh:
-                    config = tomllib.load(fh)
+                raw = candidate.read_bytes()
+            except OSError as exc:
+                logger.error("Unable to read config at {}: {}", candidate, exc)
+                last_error = exc
+                break
+            try:
+                normalized, changed = _normalize_config_bytes(raw)
+            except UnicodeDecodeError as exc:
+                logger.error("Config at {} is not valid UTF-8: {}", candidate, exc)
+                last_error = exc
+                if is_external and attempts == 1:
+                    logger.warning(
+                        "Attempting to restore {} from template due to invalid encoding.", candidate
+                    )
+                    _backup_and_restore(candidate)
+                    repaired_candidate = True
+                    continue
+                break
+            if changed:
+                try:
+                    candidate.write_text(normalized, encoding="utf-8")
+                    logger.info("Normalized config formatting at {}", candidate)
+                except OSError as exc:
+                    logger.warning("Failed to write normalized config at {}: {}", candidate, exc)
+                normalized_any = True
+            try:
+                config = tomllib.loads(normalized)
             except tomllib.TOMLDecodeError as exc:
                 logger.error("Failed to parse config at {}: {}", candidate, exc)
-                logger.info(
-                    "Open the file in a text editor, ensure it starts with [ambient] on the first line, and save it as UTF-8 without a BOM."
-                )
-                logger.info(
-                    "To recreate a clean template, rename the broken file then run tools/ensure_config.ps1 or copy homesky/config.example.toml manually."
-                )
-                raise
+                last_error = exc
+                if is_external and attempts == 1:
+                    logger.warning(
+                        "Attempting to restore {} from template; previous version saved to config.bak.",
+                        candidate,
+                    )
+                    try:
+                        _backup_and_restore(candidate)
+                        repaired_candidate = True
+                    except OSError:
+                        break
+                    continue
+                break
             print("[config] Loaded successfully")
+            load_config.last_path = candidate
+            load_config.last_was_repaired = repaired_candidate
+            load_config.last_was_normalized = normalized_any
             return config
+    if last_error:
+        raise last_error
     raise FileNotFoundError(
         "config.toml not found. Run tools/ensure_config.ps1 or copy homesky/config.example.toml to homesky/config.toml and populate your credentials."
     )
+
+
+load_config.last_path = None  # type: ignore[attr-defined]
+load_config.last_was_repaired = False  # type: ignore[attr-defined]
+load_config.last_was_normalized = False  # type: ignore[attr-defined]
 
 
 def setup_logging(config: Dict) -> None:

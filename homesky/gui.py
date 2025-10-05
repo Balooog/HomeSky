@@ -15,6 +15,11 @@ from utils.config import (
     candidate_config_paths,
     ensure_parent_directory,
 )
+
+try:
+    import tomllib  # Python 3.11+
+except ImportError:  # pragma: no cover
+    import tomli as tomllib  # type: ignore
 from utils.db import DatabaseManager
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -77,6 +82,7 @@ def run_streamlit() -> subprocess.Popen | None:
 
 def main() -> None:
     sg.theme("DarkGrey9")
+    post_init_messages: list[str] = []
     try:
         config = load_config()
     except FileNotFoundError:
@@ -87,6 +93,43 @@ def main() -> None:
             title="HomeSky configuration required",
         )
         return
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        existing = next((p for p in CONFIG_TARGETS if p.exists()), None)
+        location = f"\n\nLocation: {existing.resolve()}" if existing else ""
+        sg.popup_ok(
+            "HomeSky found a configuration file but could not parse it."
+            f"\n\nDetails: {exc}{location}\n\nReview the file for syntax errors or restore it from config.example.toml.",
+            title="HomeSky configuration error",
+        )
+        return
+    except Exception as exc:  # pragma: no cover - defensive guard
+        sg.popup_error(
+            "Unexpected error while loading configuration:\n\n"
+            f"{exc}\n\nRun tools/ensure_config.ps1 to recreate a fresh config if the issue persists.",
+            title="HomeSky configuration error",
+        )
+        return
+    repaired = getattr(ingest.load_config, "last_was_repaired", False)
+    normalized = getattr(ingest.load_config, "last_was_normalized", False)
+    source_path = getattr(ingest.load_config, "last_path", None)
+    if repaired and source_path:
+        source = Path(source_path).resolve()
+        backup = source.with_name("config.bak")
+        backup_note = (
+            f" A backup of the previous file is available at\n{backup.resolve()}"
+            if backup.exists()
+            else ""
+        )
+        sg.popup_ok(
+            "HomeSky detected a corrupt configuration file and restored a fresh template.\n\n"
+            f"Updated file: {source}.{backup_note}\n\nUpdate your Ambient Weather credentials and relaunch HomeSky.",
+            title="HomeSky configuration restored",
+        )
+        return
+    if normalized and source_path:
+        post_init_messages.append(
+            f"Config formatting normalized at {Path(source_path).resolve()}\n"
+        )
     ingest.setup_logging(config)
     storage = config.get("storage", {})
     data_dir = Path(storage.get("root_dir", "./data")).resolve()
@@ -114,6 +157,9 @@ def main() -> None:
 
     window = sg.Window("HomeSky", layout, finalize=True)
 
+    if post_init_messages:
+        for message in post_init_messages:
+            window["log"].update(message, append=True)
     if not streamlit_allowed and streamlit_reason:
         window["log"].update(f"{streamlit_reason}\n", append=True)
 
