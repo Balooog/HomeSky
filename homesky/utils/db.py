@@ -201,16 +201,18 @@ class DatabaseManager:
         epoch_ms_int = epoch_ms_series.loc[valid_mask].round().astype("int64")
         epoch_series = pd.to_numeric(df["epoch"], errors="coerce").loc[valid_mask]
         obs_time_local = pd.to_datetime(
-            df["obs_time_local"], errors="coerce", utc=True
+            df["obs_time_local"], errors="coerce"
         ).loc[valid_mask]
 
         def _ensure_column(name: str, data: pd.Series, position: int | None = None) -> None:
             if name in expanded.columns:
                 expanded[name] = data
-            elif position is None:
+                return
+            if position is None:
                 expanded[name] = data
             else:
-                expanded.insert(position, name, data)
+                if name not in expanded.columns:
+                    expanded.insert(position, name, data)
 
         _ensure_column("mac", df["mac"].loc[valid_mask], position=0)
         _ensure_column("observed_at", observed_at, position=1)
@@ -218,6 +220,10 @@ class DatabaseManager:
         _ensure_column("obs_time_local", obs_time_local, position=3)
         _ensure_column("epoch", epoch_series, position=4)
         _ensure_column("epoch_ms", epoch_ms_int, position=5)
+        if "s_time_local" not in expanded.columns:
+            expanded.insert(3, "s_time_local", obs_time_local)
+        else:
+            expanded["s_time_local"] = obs_time_local
         expanded["epoch_ms"] = expanded["epoch_ms"].astype("int64")
         expanded.index = observed_at
         return expanded
