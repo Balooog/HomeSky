@@ -168,8 +168,9 @@ class DatabaseManager:
         expanded.insert(3, "obs_time_local", obs_time_local)
         expanded.insert(4, "epoch", epoch_series.to_numpy())
         if "epoch_ms" in expanded.columns:
-            expanded.drop(columns=["epoch_ms"], inplace=True)
-        expanded.insert(5, "epoch_ms", epoch_ms_int.to_numpy())
+            expanded["epoch_ms"] = epoch_ms_int.to_numpy(dtype="int64")
+        else:
+            expanded.insert(5, "epoch_ms", epoch_ms_int.to_numpy(dtype="int64"))
         expanded.index = observed_at
         return expanded
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import hashlib
 from pathlib import Path
 from typing import Dict
 
@@ -42,7 +43,8 @@ def _cache_token(sqlite_path: str, parquet_path: str) -> str:
         except FileNotFoundError:
             resolved = path.resolve() if path.exists() else path
             parts.append(f"{resolved}:{0}:{0}")
-    return "|".join(parts)
+    digest_source = "|".join(parts)
+    return hashlib.sha1(digest_source.encode("utf-8")).hexdigest()
 
 
 @st.cache_data(ttl=60)
