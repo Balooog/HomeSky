@@ -10,11 +10,16 @@ from pathlib import Path
 import PySimpleGUI as sg
 
 import ingest
+from utils.config import (
+    bootstrap_target_path,
+    candidate_config_paths,
+    ensure_parent_directory,
+)
 from utils.db import DatabaseManager
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 CONFIG_EXAMPLE = PACKAGE_DIR / "config.example.toml"
-CONFIG_TARGETS = [Path("config.toml"), PACKAGE_DIR / "config.toml"]
+CONFIG_TARGETS = candidate_config_paths()
 STREAMLIT_ENTRY = PACKAGE_DIR / "visualize_streamlit.py"
 
 
@@ -22,7 +27,8 @@ def bootstrap_config_file() -> Path:
     for candidate in CONFIG_TARGETS:
         if candidate.exists():
             return candidate
-    target = CONFIG_TARGETS[-1]
+    target = bootstrap_target_path()
+    ensure_parent_directory(target)
     if CONFIG_EXAMPLE.exists():
         target.write_text(CONFIG_EXAMPLE.read_text(), encoding="utf-8")
     else:

@@ -12,6 +12,7 @@ import pandas as pd
 from loguru import logger
 
 from utils.ambient import AmbientClient
+from utils.config import candidate_config_paths
 from utils.db import DatabaseManager
 from utils.derived import compute_all_derived
 
@@ -21,15 +22,27 @@ except ImportError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
 
-CONFIG_PATHS = [Path("config.toml"), Path("homesky/config.toml")]
-
-
 def load_config(path: Path | None = None) -> Dict:
-    candidates = [path] if path else CONFIG_PATHS
+    if path:
+        candidates = [path]
+    else:
+        candidates = candidate_config_paths()
     for candidate in candidates:
-        if candidate and candidate.exists():
-            with candidate.open("rb") as fh:
-                return tomllib.load(fh)
+        if candidate.exists():
+            try:
+                with candidate.open("rb") as fh:
+                    config = tomllib.load(fh)
+            except tomllib.TOMLDecodeError as exc:
+                logger.error("Failed to parse config at {}: {}", candidate, exc)
+                logger.info(
+                    "Open the file in a text editor, ensure it starts with [ambient] on the first line, and save it as UTF-8 without a BOM."
+                )
+                logger.info(
+                    "To recreate a clean template, rename the broken file then run tools/ensure_config.ps1 or copy homesky/config.example.toml manually."
+                )
+                raise
+            print("[config] Loaded successfully")
+            return config
     raise FileNotFoundError(
         "config.toml not found. Run tools/ensure_config.ps1 or copy homesky/config.example.toml to homesky/config.toml and populate your credentials."
     )

@@ -1,112 +1,53 @@
 # HomeSky
 single-user Windows desktop app for Ambient Weather station with long-term capture, Dark-Sky-style visuals, and rich exports (web-ready later)
 
-### Fix-Now (if paths drift)
-
-> These commands reset you to a clean repo root, avoid double `HomeSky\HomeSky` nesting, and recreate helper scripts if they were deleted locally.
+### Daily dev run (fast feedback)
 
 ```pwsh
-# 0) Always start from the Desktop using PowerShell syntax
-Set-Location -Path "$env:USERPROFILE\Desktop"
+Set-Location "$env:USERPROFILE\Desktop"
 
-# 1) If you accidentally nested into HomeSky\HomeSky, move back up once
-if (Test-Path ".\HomeSky\HomeSky\.git") { Set-Location ".\HomeSky" }
-
-# 2) Fresh clone or refresh without double-cd
-if (Test-Path ".\HomeSky\.git") {
-  Set-Location ".\HomeSky"
-  git fetch origin
-  git reset --hard origin/main
-  git clean -xfd
-} else {
+if (-not (Test-Path ".\HomeSky")) {
   git clone https://github.com/Balooog/HomeSky.git
-  Set-Location ".\HomeSky"
 }
 
-# 3) Recreate helper scripts if they are missing
-if (-not (Test-Path ".\tools")) { New-Item -ItemType Directory -Path ".\tools" | Out-Null }
+Set-Location ".\HomeSky"
 
-@'
-param(
-  [string]$ReqPath = ".\requirements.txt",
-  [string]$ExtraIndex = "https://PySimpleGUI.net/install"
-)
+git fetch origin
+git reset --hard origin/main
+# (Keep .venv for faster runs; avoid: git clean -xfd)
 
-if (-not (Test-Path .\.venv\Scripts\Activate.ps1)) {
-  Write-Host "[venv] creating..." -ForegroundColor Cyan
-  python -m venv .venv
-}
+.\tools\ensure_venv_and_deps.ps1
+.\tools\ensure_config.ps1
 
-. .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip | Out-Null
+python .\homesky\gui.py
+# Test Build Complete
+```
 
-if (-not (Test-Path $ReqPath)) {
-  Write-Error "requirements.txt not found at $ReqPath"
-  exit 1
-}
+> Tip: `git clean -xfd` deletes `.venv/` and `homesky/config.toml`. Skip it unless you intentionally want a factory reset.
 
-$hashFile = ".\.venv\.req.hash"
-$current = (Get-FileHash $ReqPath -Algorithm SHA256).Hash
-$prior = (Test-Path $hashFile) ? (Get-Content $hashFile -Raw) : ""
+### Configure & relaunch (first run)
 
-if ($current -ne $prior) {
-  Write-Host "[deps] installing/refreshing..." -ForegroundColor Yellow
-  pip install -r $ReqPath --extra-index-url $ExtraIndex
-  Set-Content -Path $hashFile -Value $current -Encoding UTF8
-} else {
-  Write-Host "[deps] requirements unchanged -> skipping installs." -ForegroundColor Green
-}
-"@ | Out-File -Encoding utf8 ".\tools\ensure_venv_and_deps.ps1"
+> The launcher writes `homesky\config.toml` on demand.  Add your Ambient Weather keys before continuing; the file is gitignored so secrets stay local.
 
-@'
-param(
-  [string]$Config = ".\homesky\config.toml",
-  [string]$Example = ".\homesky\config.example.toml"
-)
+```pwsh
+notepad .\homesky\config.toml
+python .\homesky\gui.py
+```
 
-if (-not (Test-Path $Config)) {
-  if (Test-Path $Example) {
-    Write-Host "[config] creating from example..." -ForegroundColor Cyan
-    Copy-Item $Example $Config
-  } else {
-    Write-Host "[config] creating minimal stub..." -ForegroundColor Yellow
-@"
+### Known-good config template
+
+Paste this into `homesky\config.toml` (UTF-8 without BOM) and fill in your credentials:
+
+```toml
 [ambient]
-api_key = ""
-application_key = ""
-mac = ""
+api_key = "<YOUR_API_KEY>"
+application_key = "<YOUR_APP_KEY>"
+mac = "C4:5B:BE:6E:93:3D"
 
 [storage]
 root_dir = "./data"
 sqlite_path = "./data/homesky.sqlite"
 parquet_path = "./data/homesky.parquet"
-"@ | Out-File -Encoding utf8 $Config
-  }
-  Write-Host "[config] Edit $Config to add credentials." -ForegroundColor Yellow
-} else {
-  Write-Host "[config] present." -ForegroundColor Green
-}
-"@ | Out-File -Encoding utf8 ".\tools\ensure_config.ps1"
-```
-
-### Daily dev run (fast feedback)
-
-```pwsh
-Set-Location -Path "$env:USERPROFILE\Desktop"
-
-if (Test-Path ".\HomeSky\.git") {
-  Set-Location ".\HomeSky"
-  git fetch origin
-  git reset --hard origin/main
-  git clean -xfd
-} else {
-  git clone https://github.com/Balooog/HomeSky.git
-  Set-Location ".\HomeSky"
-}
-
-.\tools\ensure_venv_and_deps.ps1
-.\tools\ensure_config.ps1
-python .\homesky\gui.py
 ```
 
 ### Build EXE (when packaging)
