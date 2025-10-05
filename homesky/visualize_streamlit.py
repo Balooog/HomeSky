@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+from pathlib import Path
 from typing import Dict
 
 import pandas as pd
@@ -31,8 +32,22 @@ def _format_timestamp(ts: pd.Timestamp | None) -> str:
     return ts.strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _cache_token(sqlite_path: str, parquet_path: str) -> str:
+    parts = []
+    for raw_path in (sqlite_path, parquet_path):
+        path = Path(raw_path).expanduser()
+        try:
+            stat = path.stat()
+            parts.append(f"{path.resolve()}:{stat.st_size}:{int(stat.st_mtime)}")
+        except FileNotFoundError:
+            resolved = path.resolve() if path.exists() else path
+            parts.append(f"{resolved}:{0}:{0}")
+    return "|".join(parts)
+
+
 @st.cache_data(ttl=60)
-def load_data(sqlite_path: str, parquet_path: str) -> pd.DataFrame:
+def load_data(sqlite_path: str, parquet_path: str, cache_token: str) -> pd.DataFrame:
+    del cache_token  # included for cache invalidation via hash key
     storage_config: Dict[str, Dict[str, str]] = {
         "storage": {
             "sqlite_path": sqlite_path,
@@ -81,11 +96,11 @@ def main() -> None:
     typography = load_typography()
 
     storage_cfg = config.get("storage", {})
+    sqlite_path = storage_cfg.get("sqlite_path", "./data/homesky.sqlite")
+    parquet_path = storage_cfg.get("parquet_path", "./data/homesky.parquet")
+    token = _cache_token(sqlite_path, parquet_path)
     try:
-        df = load_data(
-            storage_cfg.get("sqlite_path", "./data/homesky.sqlite"),
-            storage_cfg.get("parquet_path", "./data/homesky.parquet"),
-        )
+        df = load_data(sqlite_path, parquet_path, token)
     except Exception as exc:  # pragma: no cover - surfaced via Streamlit UI
         st.error("Unable to load stored observations.")
         st.exception(exc)
@@ -115,9 +130,12 @@ def main() -> None:
     metric_index = metrics.index(default_metric) if default_metric in metrics else 0
     metric = st.sidebar.selectbox("Metric", metrics, index=metric_index)
 
-    resample_options = ["", "15min", "H", "D", "W"]
-    default_resample = config.get("visualization", {}).get("default_resample", "H")
-    resample_index = resample_options.index(default_resample) if default_resample in resample_options else 0
+    resample_options = ["", "15min", "h", "d", "w"]
+    configured_resample = config.get("visualization", {}).get("default_resample", "h")
+    if isinstance(configured_resample, str):
+        configured_resample = configured_resample.lower()
+    default_resample = configured_resample if configured_resample in resample_options else ""
+    resample_index = resample_options.index(default_resample)
     resample = st.sidebar.selectbox(
         "Resample",
         options=resample_options,

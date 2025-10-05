@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -18,29 +19,30 @@ from utils.timeparse import OfflineTimestampError, parse_offline_timestamp
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 
 CANONICAL_RENAMES = {
-    "temperaturef": "tempf",
-    "temperature_f": "tempf",
-    "temp_f": "tempf",
-    "temperature": "tempf",
+    "temperaturef": "temp_f",
+    "temperature_f": "temp_f",
+    "tempf": "temp_f",
+    "temperature": "temp_f",
     "humidity_percent": "humidity",
     "relative_humidity": "humidity",
-    "wind_speed_mph": "windspeedmph",
-    "wind_speed": "windspeedmph",
-    "windgustmph": "windgustmph",
-    "wind_gust_mph": "windgustmph",
-    "wind_gust": "windgustmph",
-    "winddir": "winddir",
-    "wind_direction": "winddir",
-    "pressurein": "baromin",
-    "baromin": "baromin",
-    "barometer_in": "baromin",
-    "precipitationin": "rainin",
-    "precip_in": "rainin",
-    "rainfall_in": "rainin",
-    "rain": "rainin",
-    "dewpointf": "dewptf",
-    "dew_point_f": "dewptf",
-    "solar_radiation": "solarradiation",
+    "wind_speed_mph": "wind_speed_mph",
+    "wind_speed": "wind_speed_mph",
+    "windspeedmph": "wind_speed_mph",
+    "wind_gust_mph": "wind_gust_mph",
+    "windgustmph": "wind_gust_mph",
+    "wind_gust": "wind_gust_mph",
+    "winddir": "wind_dir",
+    "wind_direction": "wind_dir",
+    "pressurein": "barom_in",
+    "barometer_in": "barom_in",
+    "precipitationin": "rain_in",
+    "precip_in": "rain_in",
+    "rainfall_in": "rain_in",
+    "rain": "rain_in",
+    "dewpointf": "dew_point_f",
+    "dew_point_f": "dew_point_f",
+    "dewptf": "dew_point_f",
+    "solar_radiation": "solar_radiation",
     "uv": "uv",
     "station mac": "station_mac",
     "stationmac": "station_mac",
@@ -57,6 +59,21 @@ LOCAL_TIME_CANDIDATES = (
     "datetime_local",
     "date_local",
 )
+
+
+def _isoformat_utc(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if ts is None or pd.isna(ts):
+        return None
+    dt = ts.to_pydatetime()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    epoch_ms = int(dt.timestamp() * 1000)
+    return datetime.utcfromtimestamp(epoch_ms / 1000).isoformat() + "Z"
 
 
 def _normalize_name(value: object) -> str:
@@ -115,8 +132,10 @@ def _read_table(path: Path) -> pd.DataFrame:
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     renamed = {}
     for column in df.columns:
-        lower = str(column).strip().lower()
-        renamed[column] = CANONICAL_RENAMES.get(lower, lower)
+        normalized = re.sub(r"[^a-z0-9]+", "_", str(column).strip().lower())
+        normalized = re.sub(r"__+", "_", normalized).strip("_")
+        normalized = CANONICAL_RENAMES.get(normalized, normalized)
+        renamed[column] = normalized
     normalized = df.rename(columns=renamed)
     normalized.columns = [str(col).strip() for col in normalized.columns]
     return normalized
@@ -161,17 +180,24 @@ def _prepare_dataframe(
     normalized = _normalize_columns(raw)
     try:
         timestamp_result = parse_offline_timestamp(normalized, config, interactive=interactive)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     except OfflineTimestampError as exc:
         detail_lines = "\n".join(f"- {line}" for line in exc.details) if exc.details else "(no candidate columns)"
         raise RuntimeError(
             "Unable to determine a timestamp column.\n" + detail_lines
         ) from exc
 
-    normalized["timestamp_utc"] = timestamp_result.timestamp_utc
-    normalized["dateutc"] = timestamp_result.timestamp_utc
-    normalized["obs_time_utc"] = timestamp_result.timestamp_utc
-    normalized["epoch_ms"] = timestamp_result.epoch_ms.astype("Int64")
-    normalized["epoch"] = (timestamp_result.epoch_ms // 1000).astype("Int64")
+    observed_at = timestamp_result.timestamp_utc.reindex(normalized.index)
+    epoch_ms = timestamp_result.epoch_ms.reindex(normalized.index)
+    epoch_ms_int = epoch_ms.astype("Int64")
+
+    normalized["observed_at"] = observed_at
+    normalized["timestamp_utc"] = observed_at
+    normalized["dateutc"] = observed_at
+    normalized["obs_time_utc"] = observed_at
+    normalized["epoch_ms"] = epoch_ms_int
+    normalized["epoch"] = (epoch_ms_int // 1000).astype("Int64")
 
     for line in timestamp_result.details:
         logger.debug("[offline] %s", line)
@@ -195,7 +221,7 @@ def _prepare_dataframe(
     else:
         tz_name = str(config.get("timezone", {}).get("local_tz") or "UTC")
         try:
-            normalized["timestamp_local"] = timestamp_result.timestamp_utc.dt.tz_convert(tz_name)
+            normalized["timestamp_local"] = observed_at.dt.tz_convert(tz_name)
         except Exception as exc:  # pragma: no cover - timezone fallback
             logger.debug("Unable to convert timestamps to %s: %s", tz_name, exc)
 
@@ -285,8 +311,8 @@ def import_files(
                 "rows_inserted": inserted,
                 "rows_duplicates": dropped_duplicates + duplicates_in_db,
                 "timestamp_details": timestamp_details,
-                "time_start": result.start.isoformat() if result.start is not None else None,
-                "time_end": result.end.isoformat() if result.end is not None else None,
+                "time_start": _isoformat_utc(result.start),
+                "time_end": _isoformat_utc(result.end),
             }
         )
 
@@ -304,8 +330,8 @@ def import_files(
         "total_after_dedup": total_after_dedup,
         "total_inserted": total_inserted,
         "total_duplicates": total_duplicates,
-        "time_start": overall_start.isoformat() if overall_start is not None else None,
-        "time_end": overall_end.isoformat() if overall_end is not None else None,
+        "time_start": _isoformat_utc(overall_start),
+        "time_end": _isoformat_utc(overall_end),
     }
     report_path = _write_report(config, report)
     report["report_path"] = str(report_path)
