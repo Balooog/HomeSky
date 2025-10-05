@@ -12,6 +12,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 from loguru import logger
+from zoneinfo import ZoneInfo
 
 import ingest
 from storage import StorageManager
@@ -427,11 +428,12 @@ def _prepare_dataframe(
 
     epoch_ms_int = epoch_ms_series.astype("int64")
     observed_at = pd.to_datetime(epoch_ms_int, unit="ms", utc=True)
+    observed_at_iso = observed_at.dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     valid["observed_at"] = observed_at
-    valid["timestamp_utc"] = observed_at
-    valid["dateutc"] = observed_at
-    valid["obs_time_utc"] = observed_at
+    valid["timestamp_utc"] = observed_at_iso
+    valid["dateutc"] = observed_at_iso
+    valid["obs_time_utc"] = observed_at_iso
     valid["epoch_ms"] = epoch_ms_int
     valid["epoch"] = (epoch_ms_int // 1000).astype("int64")
 
@@ -473,14 +475,35 @@ def _prepare_dataframe(
     valid["mac"] = mac_series.astype("string")
 
     local_series = _extract_local_series(valid)
+    tz_name = str(config.get("timezone", {}).get("local_tz") or tz_hint or "UTC")
     if local_series is not None:
-        valid["timestamp_local"] = local_series
+        local_dt = pd.to_datetime(local_series, errors="coerce")
+        if getattr(local_dt.dtype, "tz", None) is not None:
+            formatted_local = local_dt.dt.strftime("%Y-%m-%d %H:%M:%S%z")
+        else:
+            try:
+                zone = ZoneInfo(tz_name)
+            except Exception:  # pragma: no cover - fallback to UTC
+                zone = timezone.utc
+            localized = local_dt.dt.tz_localize(
+                zone,
+                ambiguous="infer",
+                nonexistent="shift_forward",
+            )
+            formatted_local = localized.dt.strftime("%Y-%m-%d %H:%M:%S%z")
+        valid["timestamp_local"] = formatted_local
     else:
-        tz_name = str(config.get("timezone", {}).get("local_tz") or tz_hint or "UTC")
         try:
-            valid["timestamp_local"] = observed_at.dt.tz_convert(tz_name)
+            zone = ZoneInfo(tz_name)
+        except Exception as exc:  # pragma: no cover - timezone fallback
+            logger.debug("Unable to load timezone %s: %s", tz_name, exc)
+            zone = timezone.utc
+        try:
+            local_dt = observed_at.dt.tz_convert(zone)
+            valid["timestamp_local"] = local_dt.dt.strftime("%Y-%m-%d %H:%M:%S%z")
         except Exception as exc:  # pragma: no cover - timezone fallback
             logger.debug("Unable to convert timestamps to %s: %s", tz_name, exc)
+            valid["timestamp_local"] = observed_at_iso
 
     valid = valid.dropna(subset=["epoch_ms", "timestamp_utc", "station_mac"]).reset_index(drop=True)
     return valid, details

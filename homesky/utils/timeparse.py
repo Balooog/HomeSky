@@ -13,8 +13,26 @@ from loguru import logger
 from pandas.api import types as ptypes
 from zoneinfo import ZoneInfo
 
+
+def _is_tz_aware(series: pd.Series) -> bool:
+    dtype = getattr(series, "dtype", None)
+    tz = getattr(dtype, "tz", None)
+    return tz is not None
+
 __all__ = ["normalize_columns", "to_epoch_ms", "TimestampOverride"]
 
+DEFAULT_CANDIDATES: List[str] = [
+    "epoch_ms",
+    "epoch",
+    "dateutc",
+    "date_utc",
+    "datetime",
+    "date_time",
+    "observed_at",
+    "time",
+    "date",
+    "simple_date",
+]
 
 DEFAULT_CANDIDATES: List[str] = [
     "epoch_ms",
@@ -224,11 +242,14 @@ def _finalize_from_datetime(
     valid = series.dropna()
     if valid.empty:
         return None
-    if ptypes.is_datetime64tz_dtype(valid):
+    if _is_tz_aware(valid):
         utc_values = valid.dt.tz_convert("UTC")
     else:
         utc_values = valid.dt.tz_localize("UTC")
-    values = pd.Series((utc_values.view("int64") // 1_000_000).astype("int64"), index=utc_values.index)
+    values = pd.Series(
+        (utc_values.astype("int64", copy=False) // 1_000_000).astype("int64"),
+        index=utc_values.index,
+    )
     values.attrs["source"] = source
     values.attrs["columns"] = list(columns)
     return values
@@ -297,7 +318,7 @@ def _localize_to_utc(series: pd.Series, tz_hint: str) -> Optional[pd.Series]:
         tz = ZoneInfo(tz_hint)
     except Exception:
         tz = timezone.utc
-    if ptypes.is_datetime64tz_dtype(valid):
+    if _is_tz_aware(valid):
         localized = valid.dt.tz_convert("UTC")
     else:
         try:
@@ -389,6 +410,8 @@ def _coerce_epoch_ms(
             return epoch
 
     for name in ISO_CANDIDATES:
+        if name == "date" and "time" in df.columns:
+            continue
         if name not in df.columns or (candidate_set and name not in candidate_set):
             continue
         dt = pd.to_datetime(df[name], errors="coerce", utc=True)
