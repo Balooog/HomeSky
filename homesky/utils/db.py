@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS observations (
     obs_time_utc TEXT NOT NULL,
     obs_time_local TEXT,
     epoch INTEGER,
+    epoch_ms INTEGER,
     data JSON NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(mac, obs_time_utc)
@@ -73,14 +74,36 @@ class DatabaseManager:
                     or payload_source.get("date")
                 )
                 epoch = row.get("epoch") or payload_source.get("epoch")
+                epoch_ms = row.get("epoch_ms") or payload_source.get("epoch_ms")
+                if not epoch_ms and epoch:
+                    try:
+                        epoch_ms = int(float(epoch) * 1000)
+                    except (TypeError, ValueError):
+                        epoch_ms = None
+                if not epoch_ms and obs_time_utc:
+                    try:
+                        parsed_epoch = pd.to_datetime(obs_time_utc, utc=True, errors="coerce")
+                    except Exception:  # pragma: no cover - defensive
+                        parsed_epoch = None
+                    if parsed_epoch is not None and not pd.isna(parsed_epoch):
+                        epoch_ms = int(parsed_epoch.value // 1_000_000)
+                        epoch = epoch or int(parsed_epoch.timestamp())
+                payload_source["epoch_ms"] = epoch_ms
                 payload = json.dumps(payload_source)
                 try:
                     cursor.execute(
                         """
-                        INSERT OR IGNORE INTO observations(mac, obs_time_utc, obs_time_local, epoch, data)
-                        VALUES(?,?,?,?,?)
+                        INSERT OR IGNORE INTO observations(mac, obs_time_utc, obs_time_local, epoch, epoch_ms, data)
+                        VALUES(?,?,?,?,?,?)
                         """,
-                        (mac, str(obs_time_utc), str(obs_time_local), epoch, payload),
+                        (
+                            mac,
+                            str(obs_time_utc),
+                            str(obs_time_local),
+                            epoch,
+                            epoch_ms,
+                            payload,
+                        ),
                     )
                     inserted += cursor.rowcount
                 except sqlite3.DatabaseError as exc:  # pragma: no cover
@@ -100,10 +123,21 @@ class DatabaseManager:
             row = conn.execute(query, params).fetchone()
         return row[0] if row else None
 
+    def fetch_last_epoch_ms(self, mac: Optional[str] = None) -> Optional[int]:
+        query = "SELECT epoch_ms FROM observations WHERE epoch_ms IS NOT NULL"
+        params: tuple = ()
+        if mac:
+            query += " AND mac = ?"
+            params = (mac,)
+        query += " ORDER BY epoch_ms DESC LIMIT 1"
+        with self._connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
     def read_dataframe(
         self, mac: Optional[str] = None, limit: Optional[int] = None
     ) -> pd.DataFrame:
-        query = "SELECT mac, obs_time_utc, obs_time_local, epoch, data FROM observations"
+        query = "SELECT mac, obs_time_utc, obs_time_local, epoch, epoch_ms, data FROM observations"
         params: tuple = ()
         if mac:
             query += " WHERE mac = ?"
@@ -122,6 +156,7 @@ class DatabaseManager:
         expanded.insert(1, "obs_time_utc", pd.to_datetime(df["obs_time_utc"], errors="coerce", utc=True))
         expanded.insert(2, "obs_time_local", pd.to_datetime(df["obs_time_local"], errors="coerce"))
         expanded.insert(3, "epoch", df["epoch"].values)
+        expanded.insert(4, "epoch_ms", df["epoch_ms"].values)
         return expanded
 
     # -- Parquet helpers ------------------------------------------------
@@ -149,6 +184,18 @@ def ensure_schema(sqlite_path: Path | str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
         conn.execute(OBS_TABLE_SQL)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(observations)")
+        }
+        if "epoch_ms" not in columns:
+            conn.execute("ALTER TABLE observations ADD COLUMN epoch_ms INTEGER")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_mac_epoch
+            ON observations(mac, epoch_ms)
+            WHERE epoch_ms IS NOT NULL
+            """
+        )
         conn.commit()
 
 

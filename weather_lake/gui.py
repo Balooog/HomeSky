@@ -10,7 +10,7 @@ from pathlib import Path
 import PySimpleGUI as sg
 
 import ingest
-from utils.db import DatabaseManager
+from storage import StorageResult
 
 
 def load_config() -> dict:
@@ -38,10 +38,9 @@ def main() -> None:
         sg.popup_error("Missing config.toml. Copy config.example.toml and update your credentials.")
         return
     ingest.setup_logging(config)
-    storage = config.get("storage", {})
-    data_dir = Path(storage.get("root_dir", "./data")).resolve()
-    sqlite_path = Path(storage.get("sqlite_path", "./data/weather.sqlite"))
-    parquet_path = Path(storage.get("parquet_path", "./data/lake.parquet"))
+    storage_cfg = config.get("storage", {})
+    data_dir = Path(storage_cfg.get("root_dir", "./data")).resolve()
+    storage_manager = ingest.get_storage_manager(config)
 
     layout = [
         [sg.Text("Weather Lake Control", font=("Inter", 16))],
@@ -56,7 +55,6 @@ def main() -> None:
     window = sg.Window("Weather Lake", layout, finalize=True)
 
     dashboard_process: subprocess.Popen | None = None
-    db = DatabaseManager(sqlite_path, parquet_path)
 
     while True:
         event, values = window.read(timeout=100)
@@ -64,8 +62,16 @@ def main() -> None:
             break
         if event == "fetch":
             try:
-                inserted = ingest.ingest_once(config, db)
-                window["log"].update(f"Fetched {inserted} new rows\n", append=True)
+                result = ingest.ingest_once(config, storage_manager)
+                if isinstance(result, StorageResult):
+                    message = (
+                        f"Fetched {result.inserted} new rows\n"
+                        if result.inserted
+                        else "No new rows\n"
+                    )
+                else:
+                    message = f"Fetched {result} new rows\n"
+                window["log"].update(message, append=True)
             except Exception as exc:  # pragma: no cover
                 window["log"].update(f"Error: {exc}\n", append=True)
         elif event == "dashboard":

@@ -11,10 +11,16 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 from loguru import logger
 
-from utils.ambient import AmbientClient, fetch_history
-from utils.config import candidate_config_paths, ensure_parent_directory, external_config_path
+from utils.ambient import AmbientClient
+from utils.config import (
+    candidate_config_paths,
+    ensure_parent_directory,
+    environment_config_path,
+    external_config_path,
+)
 from utils.db import DatabaseManager
 from utils.derived import compute_all_derived
+from storage import StorageManager, StorageResult, canonicalize_records
 
 try:
     import tomllib  # Python 3.11+
@@ -133,10 +139,36 @@ def _backup_and_restore(candidate: Path) -> None:
         raise
 
 
+def get_config_path() -> Path:
+    env_path = environment_config_path()
+    if env_path:
+        return env_path
+    return external_config_path()
+
+
+def ensure_config(path: Path | None = None) -> Path:
+    target = Path(path or get_config_path())
+    if target.exists():
+        return target
+    ensure_parent_directory(target)
+    try:
+        target.write_text(_template_text(), encoding="utf-8")
+    except OSError as exc:
+        logger.error("Failed to create configuration at {}: {}", target, exc)
+        raise
+    logger.info("Created starter configuration at {}", target)
+    return target
+
+
 def load_config(path: Path | None = None) -> Dict:
     load_config.last_path = None
     load_config.last_was_repaired = False
     load_config.last_was_normalized = False
+    if path is None:
+        try:
+            ensure_config(get_config_path())
+        except OSError:
+            logger.warning("Unable to ensure external configuration exists")
     candidates = [path] if path else candidate_config_paths()
     preferred_external = external_config_path()
     last_error: Exception | None = None
@@ -229,25 +261,17 @@ def setup_logging(config: Dict) -> None:
     logger.info("Logging initialized at {}", log_path)
 
 
-def get_database_manager(config: Dict) -> DatabaseManager:
-    storage = config.get("storage", {})
-    return DatabaseManager(
-        sqlite_path=Path(storage.get("sqlite_path", "./data/homesky.sqlite")),
-        parquet_path=Path(storage.get("parquet_path", "./data/homesky.parquet")),
+def get_storage_manager(config: Dict) -> StorageManager:
+    storage_cfg = config.get("storage", {})
+    return StorageManager(
+        sqlite_path=Path(storage_cfg.get("sqlite_path", "./data/homesky.sqlite")),
+        parquet_path=Path(storage_cfg.get("parquet_path", "./data/homesky.parquet")),
+        config=config,
     )
 
 
-def _store_frame(frame: pd.DataFrame, config: Dict, db: DatabaseManager) -> int:
-    if frame.empty:
-        return 0
-    records_for_db = frame.reset_index().to_dict(orient="records")
-    inserted = db.insert_observations(records_for_db)
-    if not inserted:
-        return 0
-    base = frame.drop(columns=["raw"], errors="ignore")
-    enriched = compute_all_derived(base, config)
-    db.append_parquet(enriched)
-    return inserted
+def get_database_manager(config: Dict) -> DatabaseManager:
+    return get_storage_manager(config).database
 
 
 def load_dataset(
@@ -294,14 +318,18 @@ def flatten_observations(records: List[Dict]) -> pd.DataFrame:
     return frame
 
 
-def deduplicate(df: pd.DataFrame, db: DatabaseManager, mac: str | None, enabled: bool) -> pd.DataFrame:
+def filter_new_canonical(
+    df: pd.DataFrame,
+    storage: StorageManager,
+    mac: str | None,
+    enabled: bool,
+) -> pd.DataFrame:
     if df.empty or not enabled:
         return df
-    latest = db.fetch_last_timestamp(mac)
-    if not latest:
+    latest = storage.database.fetch_last_epoch_ms(mac)
+    if latest is None:
         return df
-    mask = df.index > pd.to_datetime(latest, utc=True)
-    return df.loc[mask]
+    return df[df["epoch_ms"] > latest]
 
 
 def detect_cadence_seconds(df: pd.DataFrame) -> int:
@@ -380,97 +408,124 @@ def backfill(
     config: Dict,
     hours: int,
     *,
-    db: Optional[DatabaseManager] = None,
+    storage: Optional[StorageManager] = None,
     tz: Optional[str] = None,
 ) -> int:
     if hours <= 0:
         return 0
-    ambient_cfg = config.get("ambient", {})
-    api_key = ambient_cfg.get("api_key")
-    app_key = ambient_cfg.get("application_key")
-    mac = ambient_cfg.get("mac") or None
-    if not api_key or not app_key:
-        raise ValueError("Ambient Weather API credentials are required for backfill")
-    timezone_name = tz or config.get("timezone", {}).get("local_tz", "America/New_York")
-    history = fetch_history(api_key, app_key, mac, hours=hours, tz=timezone_name)
-    if not history:
-        logger.info("Backfill request returned no history rows")
-        return 0
-    frame = _history_records_to_frame(history, mac)
-    if frame.empty:
-        logger.info("Backfill history contained no usable observations")
-        return 0
-    if config.get("ingest", {}).get("drop_implausible_values", True):
-        frame = drop_implausible(frame)
-        if frame.empty:
-            logger.info("Backfill skipped after filtering implausible values")
-            return 0
-    target_db = db or get_database_manager(config)
-    inserted = _store_frame(frame, config, target_db)
-    logger.info("Backfill inserted {} rows", inserted)
-    return inserted
+    storage_manager = storage or get_storage_manager(config)
+    mac = config.get("ambient", {}).get("mac") or None
+    if not mac:
+        raise ValueError("A device MAC address is required for backfill operations")
+    end = pd.Timestamp.utcnow().tz_localize("UTC")
+    start = end - pd.Timedelta(hours=hours)
+    try:
+        from backfill import backfill_range
+    except ImportError as exc:  # pragma: no cover - fallback for older setups
+        raise RuntimeError("backfill module is unavailable") from exc
+    result = backfill_range(
+        config=config,
+        storage=storage_manager,
+        start_dt=start,
+        end_dt=end,
+        mac=mac,
+        window_minutes=int(pd.Timedelta(days=1).total_seconds() // 60),
+        limit_per_call=int(config.get("ingest", {}).get("backfill_limit", 288) or 288),
+    )
+    return result.inserted
 
 
-def maybe_auto_backfill(config: Dict, db: DatabaseManager) -> None:
+def maybe_auto_backfill(config: Dict, storage: StorageManager) -> None:
     ingest_cfg = config.get("ingest", {})
     hours = int(ingest_cfg.get("backfill_hours", 0) or 0)
     if hours <= 0:
         return
+    db = storage.database
     if not is_first_run(db):
         return
     try:
-        inserted = backfill(config, hours=hours, db=db)
+        from backfill import backfill_range
+    except ImportError:
+        logger.warning("Backfill module unavailable; skipping automatic backfill")
+        return
+    mac = config.get("ambient", {}).get("mac") or None
+    if not mac:
+        logger.warning("Cannot run automatic backfill without a configured MAC address")
+        return
+    end = pd.Timestamp.utcnow().tz_localize("UTC")
+    start = end - pd.Timedelta(hours=hours)
+    try:
+        result = backfill_range(
+            config=config,
+            storage=storage,
+            start_dt=start,
+            end_dt=end,
+            mac=mac,
+            limit_per_call=ingest_cfg.get("backfill_limit", 288),
+        )
     except Exception as exc:  # pragma: no cover - log and continue ingestion
         logger.warning("First-run backfill failed: {}", exc)
         return
-    if inserted:
-        logger.info("First-run backfill added {} rows", inserted)
+    if result.inserted:
+        logger.info(
+            "First-run backfill added %s rows (%s to %s)",
+            result.inserted,
+            result.start,
+            result.end,
+        )
     else:
         logger.info("First-run backfill found no additional rows")
 
 
-def ingest_once(config: Dict, db: DatabaseManager) -> int:
+def ingest_once(config: Dict, storage: StorageManager) -> StorageResult:
+    ambient_cfg = config.get("ambient", {})
     client = AmbientClient(
-        api_key=config["ambient"]["api_key"],
-        application_key=config["ambient"]["application_key"],
-        mac=config["ambient"].get("mac") or None,
-        retries=config.get("ingest", {}).get("max_retries", 3),
-        backoff=config.get("ingest", {}).get("retry_backoff_sec", 10),
+        api_key=ambient_cfg.get("api_key"),
+        application_key=ambient_cfg.get("application_key"),
+        mac=ambient_cfg.get("mac") or None,
     )
-    records = client.get_device_data(limit=288)
-    frame = flatten_observations(records)
+    mac = ambient_cfg.get("mac") or None
+    limit = int(config.get("ingest", {}).get("fetch_limit", 288) or 288)
+    records = client.get_device_data(mac=mac, limit=limit)
+    frame = _history_records_to_frame(records, mac)
     if config.get("ingest", {}).get("drop_implausible_values", True):
         frame = drop_implausible(frame)
-    frame = deduplicate(
-        frame,
-        db,
-        mac=config["ambient"].get("mac") or None,
+    canonical = canonicalize_records(frame.reset_index().to_dict(orient="records"), mac_hint=mac)
+    canonical = filter_new_canonical(
+        canonical,
+        storage,
+        mac,
         enabled=config.get("ingest", {}).get("deduplicate_by_timestamp", True),
     )
-    if frame.empty:
+    if canonical.empty:
         logger.info("No new observations to ingest.")
-        return 0
-    inserted = _store_frame(frame, config, db)
-    if inserted:
-        logger.info("Ingested {} new observation rows", inserted)
+        return StorageResult(0, None, None)
+    result = storage.upsert_canonical(canonical)
+    if result.inserted:
+        logger.info(
+            "Ingested %s new observation rows (%s to %s)",
+            result.inserted,
+            result.start,
+            result.end,
+        )
     else:
         logger.info("No new observations to ingest.")
-    return inserted
+    return result
 
 
-def run_loop(config: Dict, db: DatabaseManager) -> None:
+def run_loop(config: Dict, storage: StorageManager) -> None:
     poll_seconds = 60
     while True:
         try:
-            inserted = ingest_once(config, db)
+            result = ingest_once(config, storage)
         except KeyboardInterrupt:
             logger.info("Ingest loop interrupted by user")
             raise
         except Exception as exc:  # pragma: no cover
             logger.exception("Ingest failed: {}", exc)
         else:
-            if inserted:
-                poll_seconds = detect_cadence_seconds(db.read_dataframe(limit=10))
+            if result.inserted:
+                poll_seconds = detect_cadence_seconds(storage.database.read_dataframe(limit=10))
         logger.info("Sleeping for {} seconds", poll_seconds)
         time.sleep(poll_seconds)
 
@@ -486,13 +541,13 @@ def main() -> None:
     config = load_config()
     setup_logging(config)
     logger.info("Starting HomeSky ingest service")
-    db = get_database_manager(config)
+    storage = get_storage_manager(config)
     try:
-        maybe_auto_backfill(config, db)
+        maybe_auto_backfill(config, storage)
         if args.once:
-            ingest_once(config, db)
+            ingest_once(config, storage)
         else:
-            run_loop(config, db)
+            run_loop(config, storage)
     except KeyboardInterrupt:
         logger.info("Shutdown requested. Exiting.")
 
