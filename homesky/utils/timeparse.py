@@ -8,6 +8,7 @@ import unicodedata
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
+from pandas.api import types as ptypes
 from loguru import logger
 from pandas.api import types as ptypes
 from zoneinfo import ZoneInfo
