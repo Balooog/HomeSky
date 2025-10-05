@@ -73,7 +73,9 @@ def _format_timestamp(ts: object) -> str:
         dt = dt.replace(tzinfo=timezone.utc)
     else:
         dt = dt.astimezone(timezone.utc)
-    return dt.strftime("%Y-%m-%d %H:%M UTC")
+    epoch_ms = int(dt.timestamp() * 1000)
+    iso_utc = datetime.utcfromtimestamp(epoch_ms / 1000).isoformat()
+    return f"{iso_utc}Z"
 
 
 def describe_result(action: str, result: StorageResult) -> str:

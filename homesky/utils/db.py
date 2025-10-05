@@ -151,13 +151,27 @@ class DatabaseManager:
         if df.empty:
             return df
         expanded = pd.json_normalize(df["data"].apply(json.loads))
-        expanded.index = pd.to_datetime(df["obs_time_utc"], errors="coerce", utc=True)
-        expanded.insert(0, "mac", df["mac"].values)
-        expanded.insert(1, "obs_time_utc", pd.to_datetime(df["obs_time_utc"], errors="coerce", utc=True))
-        expanded.insert(2, "obs_time_local", pd.to_datetime(df["obs_time_local"], errors="coerce"))
-        expanded.insert(3, "epoch", df["epoch"].values)
-        if "epoch_ms" not in expanded.columns:
-            expanded.insert(4, "epoch_ms", df["epoch_ms"].values)
+        epoch_ms_series = pd.to_numeric(df["epoch_ms"], errors="coerce")
+        observed_at = pd.to_datetime(epoch_ms_series, unit="ms", errors="coerce", utc=True)
+        valid_mask = observed_at.notna()
+        if not bool(valid_mask.any()):
+            return expanded.iloc[0:0]
+        expanded = expanded.loc[valid_mask.values].copy()
+        observed_at = observed_at.loc[valid_mask]
+        epoch_ms_int = epoch_ms_series.loc[valid_mask].round().astype("int64")
+        epoch_series = pd.to_numeric(df["epoch"], errors="coerce").loc[valid_mask]
+        obs_time_local = pd.to_datetime(df["obs_time_local"], errors="coerce").loc[valid_mask]
+
+        expanded.insert(0, "mac", df["mac"].loc[valid_mask].values)
+        expanded.insert(1, "observed_at", observed_at)
+        expanded.insert(2, "obs_time_utc", observed_at)
+        expanded.insert(3, "obs_time_local", obs_time_local)
+        expanded.insert(4, "epoch", epoch_series.to_numpy())
+        if "epoch_ms" in expanded.columns:
+            expanded["epoch_ms"] = epoch_ms_int.to_numpy(dtype="int64")
+        else:
+            expanded.insert(5, "epoch_ms", epoch_ms_int.to_numpy(dtype="int64"))
+        expanded.index = observed_at
         return expanded
 
     # -- Parquet helpers ------------------------------------------------
