@@ -6,12 +6,12 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from loguru import logger
 
-from utils.ambient import AmbientClient
+from utils.ambient import AmbientClient, fetch_history
 from utils.config import candidate_config_paths, ensure_parent_directory, external_config_path
 from utils.db import DatabaseManager
 from utils.derived import compute_all_derived
@@ -229,6 +229,44 @@ def setup_logging(config: Dict) -> None:
     logger.info("Logging initialized at {}", log_path)
 
 
+def get_database_manager(config: Dict) -> DatabaseManager:
+    storage = config.get("storage", {})
+    return DatabaseManager(
+        sqlite_path=Path(storage.get("sqlite_path", "./data/homesky.sqlite")),
+        parquet_path=Path(storage.get("parquet_path", "./data/homesky.parquet")),
+    )
+
+
+def _store_frame(frame: pd.DataFrame, config: Dict, db: DatabaseManager) -> int:
+    if frame.empty:
+        return 0
+    records_for_db = frame.reset_index().to_dict(orient="records")
+    inserted = db.insert_observations(records_for_db)
+    if not inserted:
+        return 0
+    base = frame.drop(columns=["raw"], errors="ignore")
+    enriched = compute_all_derived(base, config)
+    db.append_parquet(enriched)
+    return inserted
+
+
+def load_dataset(
+    config: Dict | None = None,
+    *,
+    sqlite_path: Path | str | None = None,
+    parquet_path: Path | str | None = None,
+    limit: int | None = None,
+) -> pd.DataFrame:
+    """Load stored observations into a DataFrame."""
+
+    cfg = config or {}
+    storage = cfg.get("storage", {})
+    sqlite_resolved = Path(sqlite_path or storage.get("sqlite_path", "./data/homesky.sqlite"))
+    parquet_resolved = Path(parquet_path or storage.get("parquet_path", "./data/homesky.parquet"))
+    db = DatabaseManager(sqlite_resolved, parquet_resolved)
+    return db.read_dataframe(limit=limit)
+
+
 def flatten_observations(records: List[Dict]) -> pd.DataFrame:
     rows: List[Dict] = []
     for device in records:
@@ -292,6 +330,105 @@ def drop_implausible(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[mask]
 
 
+def _history_records_to_frame(records: List[Dict], mac_fallback: Optional[str]) -> pd.DataFrame:
+    rows: List[Dict] = []
+    for entry in records:
+        if not isinstance(entry, dict):
+            continue
+        raw = dict(entry)
+        mac_value = raw.get("macAddress") or raw.get("mac") or mac_fallback or "unknown"
+        dateutc = raw.get("dateutc")
+        if isinstance(dateutc, (int, float)):
+            obs_time_utc = pd.to_datetime(dateutc, unit="ms", errors="coerce", utc=True)
+        else:
+            obs_time_utc = pd.to_datetime(dateutc, errors="coerce", utc=True)
+        if pd.isna(obs_time_utc):
+            continue
+        row = {**raw}
+        row["mac"] = mac_value
+        row["obs_time_utc"] = obs_time_utc
+        if "date" in raw and raw["date"]:
+            row["obs_time_local"] = pd.to_datetime(raw["date"], errors="coerce")
+        elif "obs_time_local" in raw and raw["obs_time_local"]:
+            row["obs_time_local"] = pd.to_datetime(raw["obs_time_local"], errors="coerce")
+        row["raw"] = raw
+        rows.append(row)
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    frame = frame.dropna(subset=["obs_time_utc"])
+    if frame.empty:
+        return frame
+    frame = frame.sort_values("obs_time_utc")
+    frame = frame.set_index("obs_time_utc")
+    frame = frame[~frame.index.duplicated(keep="last")]
+    return frame
+
+
+def is_first_run(db: DatabaseManager) -> bool:
+    try:
+        snapshot = db.read_dataframe(limit=1)
+    except FileNotFoundError:
+        return True
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.warning("Unable to determine first-run status: {}", exc)
+        return False
+    return snapshot.empty
+
+
+def backfill(
+    config: Dict,
+    hours: int,
+    *,
+    db: Optional[DatabaseManager] = None,
+    tz: Optional[str] = None,
+) -> int:
+    if hours <= 0:
+        return 0
+    ambient_cfg = config.get("ambient", {})
+    api_key = ambient_cfg.get("api_key")
+    app_key = ambient_cfg.get("application_key")
+    mac = ambient_cfg.get("mac") or None
+    if not api_key or not app_key:
+        raise ValueError("Ambient Weather API credentials are required for backfill")
+    timezone_name = tz or config.get("timezone", {}).get("local_tz", "America/New_York")
+    history = fetch_history(api_key, app_key, mac, hours=hours, tz=timezone_name)
+    if not history:
+        logger.info("Backfill request returned no history rows")
+        return 0
+    frame = _history_records_to_frame(history, mac)
+    if frame.empty:
+        logger.info("Backfill history contained no usable observations")
+        return 0
+    if config.get("ingest", {}).get("drop_implausible_values", True):
+        frame = drop_implausible(frame)
+        if frame.empty:
+            logger.info("Backfill skipped after filtering implausible values")
+            return 0
+    target_db = db or get_database_manager(config)
+    inserted = _store_frame(frame, config, target_db)
+    logger.info("Backfill inserted {} rows", inserted)
+    return inserted
+
+
+def maybe_auto_backfill(config: Dict, db: DatabaseManager) -> None:
+    ingest_cfg = config.get("ingest", {})
+    hours = int(ingest_cfg.get("backfill_hours", 0) or 0)
+    if hours <= 0:
+        return
+    if not is_first_run(db):
+        return
+    try:
+        inserted = backfill(config, hours=hours, db=db)
+    except Exception as exc:  # pragma: no cover - log and continue ingestion
+        logger.warning("First-run backfill failed: {}", exc)
+        return
+    if inserted:
+        logger.info("First-run backfill added {} rows", inserted)
+    else:
+        logger.info("First-run backfill found no additional rows")
+
+
 def ingest_once(config: Dict, db: DatabaseManager) -> int:
     client = AmbientClient(
         api_key=config["ambient"]["api_key"],
@@ -313,11 +450,11 @@ def ingest_once(config: Dict, db: DatabaseManager) -> int:
     if frame.empty:
         logger.info("No new observations to ingest.")
         return 0
-    records_for_db = frame.reset_index().to_dict(orient="records")
-    inserted = db.insert_observations(records_for_db)
-    enriched = compute_all_derived(frame.drop(columns=["raw"], errors="ignore"), config)
-    db.append_parquet(enriched)
-    logger.info("Ingested {} new observation rows", inserted)
+    inserted = _store_frame(frame, config, db)
+    if inserted:
+        logger.info("Ingested {} new observation rows", inserted)
+    else:
+        logger.info("No new observations to ingest.")
     return inserted
 
 
@@ -349,12 +486,9 @@ def main() -> None:
     config = load_config()
     setup_logging(config)
     logger.info("Starting HomeSky ingest service")
-    storage = config.get("storage", {})
-    db = DatabaseManager(
-        sqlite_path=Path(storage.get("sqlite_path", "./data/homesky.sqlite")),
-        parquet_path=Path(storage.get("parquet_path", "./data/homesky.parquet")),
-    )
+    db = get_database_manager(config)
     try:
+        maybe_auto_backfill(config, db)
         if args.once:
             ingest_once(config, db)
         else:
