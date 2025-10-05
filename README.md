@@ -50,9 +50,16 @@ python .\homesky\gui.py
   launch_streamlit = true
   dashboard_port = 8501
   ```
-- **Fetching more history** – Click **Backfill (24h)** in the GUI to pull a full day of history on demand. The ingest
-  service also backfills automatically on the first run using the `[ingest].backfill_hours` setting in `config.toml`, so
-  there is no need to delete the existing database to "force" older data.
+- **Fetching more history** – Click **Backfill (24h)** in the GUI to pull a full day of history on demand. Use
+  **Backfill (custom)** to enter wider ranges; progress is checkpointed to `data/state/backfill.json` so interrupted jobs
+  resume safely. The ingest service also backfills automatically on the first run using the `[ingest].backfill_hours`
+  setting in `config.toml`, so there is no need to delete the existing database to "force" older data.
+- **API limits respected** – Ambient Weather limits each user key to ~1 request/sec (and each application key to 3/sec).
+  HomeSky enforces these ceilings with a shared throttle, jitter, and exponential backoff (1s → 2s → 4s → 8s) so long
+  backfills finish without `429` storms.
+- **Offline imports** – Fill historical gaps without touching the API. Drop CSV/XLSX exports in the GUI via
+  **Import file(s)** (or run `python -m homesky.import_offline data/import/*.csv`) and HomeSky will normalize the columns,
+  dedupe by `(mac, epoch_ms)`, append to SQLite/Parquet, and write a JSON report to `data/logs/import_*.json`.
 
 ### Known-good config template
 

@@ -15,6 +15,22 @@ from utils.derived import compute_all_derived
 from utils.theming import get_theme, load_typography
 
 
+def _format_timestamp(ts: pd.Timestamp | None) -> str:
+    if ts is None or (isinstance(ts, float) and pd.isna(ts)):
+        return "n/a"
+    if isinstance(ts, pd.Series):
+        ts = ts.iloc[0]
+    if isinstance(ts, pd.DatetimeIndex):
+        ts = ts[-1]
+    if not isinstance(ts, pd.Timestamp):
+        return str(ts)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts.strftime("%Y-%m-%d %H:%M UTC")
+
+
 @st.cache_data(ttl=60)
 def load_data(sqlite_path: str, parquet_path: str) -> pd.DataFrame:
     storage_config: Dict[str, Dict[str, str]] = {
@@ -41,9 +57,9 @@ def main() -> None:
         st.error(
             "HomeSky configuration not found. The dashboard now uses the same loader as the GUI."
         )
+        expected_path = ingest.get_config_path()
         st.info(
-            "Ensure a valid config exists at %APPDATA%\\HomeSky\\config.toml or run"
-            " tools/ensure_config.ps1 to generate one."
+            f"Ensure a valid config exists at `{expected_path}` or run tools/ensure_config.ps1 to generate one."
         )
         st.exception(exc)
         st.stop()
@@ -74,6 +90,14 @@ def main() -> None:
         st.stop()
 
     df = compute_all_derived(df, config)
+
+    latest_ts = df.index.max() if not df.empty else None
+    st.markdown(
+        f"<div style='display:inline-block;padding:0.35rem 0.75rem;border-radius:999px;background-color:#1f77b4;color:white;font-weight:600;'>"
+        f"Latest: {_format_timestamp(latest_ts)} • {len(df):,} rows"  # noqa: E501
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
     st.sidebar.header("Controls")
     numeric_columns = [col for col in df.columns if ptypes.is_numeric_dtype(df[col])]
