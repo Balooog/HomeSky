@@ -538,14 +538,25 @@ def main() -> None:
                     title="HomeSky import error",
                 )
             else:
-                summary = (
-                    f"Imported {report['total_inserted']} rows from {len(paths)} file(s)."
-                )
+                inserted = int(report.get("total_inserted") or 0)
+                duplicates = int(report.get("total_duplicates") or 0)
+                file_count = len(paths)
+                if inserted == 0 and duplicates > 0:
+                    summary = (
+                        f"No new rows; {duplicates:,} duplicate rows already existed across {file_count} file(s)."
+                    )
+                elif inserted == 0:
+                    summary = f"No rows imported from {file_count} file(s)."
+                else:
+                    summary = (
+                        f"Imported {inserted:,} new row{'s' if inserted != 1 else ''} "
+                        f"({duplicates:,} duplicates ignored) from {file_count} file(s)."
+                    )
                 if report.get("time_start") and report.get("time_end"):
                     summary += (
-                        f" Range: {report['time_start']} – {report['time_end']}."
+                        f" Range merged: {report['time_start']} – {report['time_end']}."
                     )
-                summary += f" Report: {report['report_path']}"
+                summary += f" Report saved to {report['report_path']}"
                 window["log"].update(summary + "\n", append=True)
                 data_dir.mkdir(parents=True, exist_ok=True)
                 try:

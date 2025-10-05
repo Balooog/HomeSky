@@ -21,6 +21,13 @@ def _is_tz_aware(series: pd.Series) -> bool:
 
 __all__ = ["normalize_columns", "to_epoch_ms", "TimestampOverride"]
 
+def _is_tz_aware(series: pd.Series) -> bool:
+    dtype = getattr(series, "dtype", None)
+    tz = getattr(dtype, "tz", None)
+    return tz is not None
+
+__all__ = ["normalize_columns", "to_epoch_ms", "TimestampOverride"]
+
 DEFAULT_CANDIDATES: List[str] = [
     "epoch_ms",
     "epoch",
