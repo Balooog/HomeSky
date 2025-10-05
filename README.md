@@ -34,6 +34,26 @@ notepad .\homesky\config.toml
 python .\homesky\gui.py
 ```
 
+### FAQ — "Fetched 1 new rows"
+
+- **What it means** – HomeSky only appends observations whose `dateutc` timestamp is newer than the last stored
+  record. If Ambient publishes a single fresh sample you will see `Fetched 1 new rows` in the GUI log. A run with no
+  newer data prints `Fetched 0 new rows` and keeps the database unchanged.
+- **Where the row lives** – Open the data folder (`.\data` from the repo, or the path configured under `[storage]`).
+  `homesky.sqlite` is the canonical append-only table, while `homesky.parquet` (when enabled) mirrors the same rows in a
+  columnar format for external tooling.
+- **See it on the dashboard** – Re-enable Streamlit autolaunch by adding the block below to your roaming config
+  (usually `%APPDATA%\HomeSky\config.toml`). Restart the GUI and click **Open Dashboard** to load the charts.
+
+  ```toml
+  [ui]
+  launch_streamlit = true
+  dashboard_port = 8501
+  ```
+- **Fetching more history** – The current build ingests incremental updates as they arrive. A dedicated backfill command
+  (to load large historical windows) is planned for a follow-up release, so there is no need to delete the existing
+  database to "force" older data.
+
 ### Known-good config template
 
 Paste this into `homesky\config.toml` (UTF-8 without BOM) and fill in your credentials:
