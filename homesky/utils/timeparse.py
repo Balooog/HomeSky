@@ -8,6 +8,7 @@ import unicodedata
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
+from pandas.api import types as ptypes
 from loguru import logger
 from pandas.api import types as ptypes
 from zoneinfo import ZoneInfo
@@ -20,6 +21,25 @@ def _is_tz_aware(series: pd.Series) -> bool:
 
 __all__ = ["normalize_columns", "to_epoch_ms", "TimestampOverride"]
 
+def _is_tz_aware(series: pd.Series) -> bool:
+    dtype = getattr(series, "dtype", None)
+    tz = getattr(dtype, "tz", None)
+    return tz is not None
+
+__all__ = ["normalize_columns", "to_epoch_ms", "TimestampOverride"]
+
+DEFAULT_CANDIDATES: List[str] = [
+    "epoch_ms",
+    "epoch",
+    "dateutc",
+    "date_utc",
+    "datetime",
+    "date_time",
+    "observed_at",
+    "time",
+    "date",
+    "simple_date",
+]
 
 DEFAULT_CANDIDATES: List[str] = [
     "epoch_ms",
