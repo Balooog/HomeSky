@@ -1,0 +1,49 @@
+[ambient]
+api_key = "YOUR_API_KEY"
+application_key = "YOUR_APPLICATION_KEY"
+mac = ""  # optional; if multiple stations, set a specific MAC
+
+[storage]
+root_dir = "./data"
+sqlite_path = "./data/homesky.sqlite"
+parquet_path = "./data/homesky.parquet"
+
+[timezone]
+local_tz = "America/New_York"
+
+[units]
+temperature = "F"  # F or C
+wind = "mph"       # mph or mps
+rain = "in"        # in or mm
+
+[derived]
+hdd_base_f = 65
+cdd_base_f = 65
+enable_wetbulb = true
+enable_vpd = true
+enable_wind_run = true
+
+[ingest]
+deduplicate_by_timestamp = true
+drop_implausible_values = true
+log_path = "./data/logs/ingest.log"
+log_rotate_days = 14
+max_retries = 3
+retry_backoff_sec = 10
+
+[visualization]
+default_metric = "temp_f"
+default_resample = "H"
+default_aggregate = "mean"
+theme = "dark"  # dark | light | system
+
+[alerts]
+enabled = false
+temp_high_f = 95
+temp_low_f = 10
+gust_high_mph = 45
+hourly_rain_in = 0.5
+quiet_hours_local = "22:00-07:00"
+
+[ui]
+launch_streamlit = false  # enable when visualize_streamlit.py is available
