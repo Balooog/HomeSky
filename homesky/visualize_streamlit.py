@@ -63,6 +63,69 @@ def _get_zone(tz_name: str) -> ZoneInfo:
         return ZoneInfo("UTC")
 
 
+def ensure_time_index(df: pd.DataFrame, tz_name: str) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    working = df.copy()
+    zone = _get_zone(tz_name)
+
+    if "s_time_local" in working.columns:
+        index_series = pd.to_datetime(working["s_time_local"], errors="coerce")
+        if getattr(index_series.dtype, "tz", None) is None:
+            try:
+                index_series = index_series.dt.tz_localize(
+                    zone, ambiguous="NaT", nonexistent="shift_forward"
+                )
+            except Exception:
+                index_series = index_series.dt.tz_localize(
+                    zone, ambiguous=True, nonexistent="shift_forward"
+                )
+        else:
+            try:
+                index_series = index_series.dt.tz_convert(zone)
+            except Exception:
+                index_series = index_series.dt.tz_localize(
+                    zone, ambiguous="NaT", nonexistent="shift_forward"
+                )
+    elif isinstance(working.index, pd.DatetimeIndex) and working.index.name == "s_time_local":
+        index_series = pd.DatetimeIndex(working.index)
+        if index_series.tz is None:
+            index_series = index_series.tz_localize(
+                zone, ambiguous="NaT", nonexistent="shift_forward"
+            )
+        else:
+            index_series = index_series.tz_convert(zone)
+    elif "epoch_ms" in working.columns:
+        epoch_series = pd.to_numeric(working["epoch_ms"], errors="coerce")
+        index_series = pd.to_datetime(
+            epoch_series, unit="ms", errors="coerce", utc=True
+        )
+        index_series = index_series.dt.tz_convert(zone)
+    else:
+        raise ValueError("No time source found (need s_time_local or epoch_ms)")
+
+    mask = ~pd.isna(index_series)
+    working = working.loc[mask].copy()
+    index = pd.DatetimeIndex(index_series.loc[mask])
+    working = working.drop(columns=["s_time_local"], errors="ignore")
+    working.index = index
+    working = working.sort_index(kind="mergesort")
+    working.index.name = "s_time_local"
+    return working
+
+
+def ensure_time_column(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    if df.index.name == "s_time_local":
+        out = df.reset_index()
+        if "s_time_local" in out.columns[1:]:
+            out = out.loc[:, ~out.columns.duplicated()]
+        return out
+    return df.copy()
+
+
 def _safe_localize_day(value: pd.Timestamp | str, zone: ZoneInfo) -> pd.Timestamp:
     """Return a timezone-aware timestamp for the start of *value*'s day."""
 
@@ -161,58 +224,23 @@ def _available_metrics(df: pd.DataFrame) -> List[Tuple[str, str]]:
 def _prepare_time_columns(df: pd.DataFrame, tz_name: str) -> pd.DataFrame:
     if df.empty:
         return df
-    zone = _get_zone(tz_name)
-    working = df.copy()
+    working = ensure_time_index(df, tz_name)
 
-    if isinstance(working.index, pd.DatetimeIndex):
-        idx = working.index
-        if idx.tz is None:
-            idx = idx.tz_localize("UTC")
-        else:
-            idx = idx.tz_convert("UTC")
-        working["s_time_utc"] = idx
+    utc_index = working.index.tz_convert("UTC")
+    if "s_time_utc" in working.columns:
+        s_time_utc = pd.to_datetime(working["s_time_utc"], errors="coerce", utc=True)
+        mask = s_time_utc.notna()
+        if mask.any():
+            utc_index = utc_index.where(~mask, s_time_utc)
+    working["s_time_utc"] = utc_index
+
+    if "epoch_ms" in working.columns:
+        epoch_numeric = pd.to_numeric(working["epoch_ms"], errors="coerce")
+        working["epoch_ms"] = epoch_numeric.astype("Int64")
     else:
-        working["s_time_utc"] = pd.NaT
+        working["epoch_ms"] = (utc_index.view("int64") // 1_000_000).astype("int64")
 
-    for candidate in ("s_time_utc", "observed_at", "obs_time_utc", "timestamp_utc", "dateutc"):
-        if candidate in working.columns:
-            utc_series = pd.to_datetime(working[candidate], errors="coerce", utc=True)
-            mask = utc_series.notna()
-            working.loc[mask, "s_time_utc"] = utc_series.loc[mask]
-
-    if working["s_time_utc"].isna().any() and "epoch_ms" in working.columns:
-        epoch_dt = pd.to_datetime(pd.to_numeric(working["epoch_ms"], errors="coerce"), unit="ms", errors="coerce", utc=True)
-        mask = epoch_dt.notna() & working["s_time_utc"].isna()
-        working.loc[mask, "s_time_utc"] = epoch_dt.loc[mask]
-
-    working = working.dropna(subset=["s_time_utc"]).copy()
-
-    local_candidates = None
-    for name in ("s_time_local", "timestamp_local", "obs_time_local"):
-        if name in working.columns:
-            local_candidates = pd.to_datetime(working[name], errors="coerce")
-            if local_candidates.notna().any():
-                break
-    if local_candidates is not None:
-        if getattr(local_candidates.dtype, "tz", None) is None:
-            try:
-                local_series = local_candidates.dt.tz_localize(
-                    zone, ambiguous=False, nonexistent="shift_forward"
-                )
-            except Exception:
-                local_series = working["s_time_utc"].dt.tz_convert(zone)
-        else:
-            try:
-                local_series = local_candidates.dt.tz_convert(zone)
-            except Exception:
-                local_series = working["s_time_utc"].dt.tz_convert(zone)
-    else:
-        local_series = working["s_time_utc"].dt.tz_convert(zone)
-
-    working["s_time_local"] = local_series
-    working = working.sort_values("s_time_local")
-    working = working.set_index("s_time_local", drop=False)
-    return working
+    return ensure_time_column(working)
 
 
 def _latest_numeric(series: pd.Series) -> float:
@@ -439,46 +467,36 @@ def sanitize_for_arrow(
 ) -> pd.DataFrame:
     if df.empty:
         return df.copy()
-    df = df.reset_index()
+    sanitized = ensure_time_index(df, tz_name)
+
     keep: List[str] = []
-    for name in ("mac", "epoch_ms", "s_time_local", "s_time_utc", "dateutc"):
-        if name in df.columns:
+    for name in ("mac", "epoch_ms", "s_time_utc", "dateutc"):
+        if name in sanitized.columns:
             keep.append(name)
     if value_columns is not None:
-        keep.extend(col for col in value_columns if col in df.columns)
-    keep = list(dict.fromkeys(keep))  # preserve order, drop duplicates
-    sanitized = df.loc[:, keep].copy() if keep else df.copy()
+        keep.extend(col for col in value_columns if col in sanitized.columns)
+    keep = list(dict.fromkeys(keep))
+    if keep:
+        sanitized = sanitized.loc[:, keep].copy()
+    else:
+        sanitized = sanitized.copy()
 
     zone = _get_zone(tz_name)
-    if "s_time_local" in sanitized.columns:
-        local_series = pd.to_datetime(sanitized["s_time_local"], errors="coerce")
-    else:
-        local_series = pd.to_datetime(df.index, errors="coerce")
-    if getattr(local_series.dtype, "tz", None) is None:
-        try:
-            local_series = local_series.dt.tz_localize(
-                zone, ambiguous=False, nonexistent="shift_forward"
-            )
-        except Exception:
-            local_series = local_series.dt.tz_localize(zone, nonexistent="shift_forward")
-    else:
-        try:
-            local_series = local_series.dt.tz_convert(zone)
-        except Exception:
-            local_series = local_series.dt.tz_localize(zone, nonexistent="shift_forward")
-    sanitized["s_time_local"] = local_series
-
-    if "s_time_utc" in sanitized.columns:
-        utc_series = pd.to_datetime(sanitized["s_time_utc"], errors="coerce", utc=True)
-    else:
-        utc_series = sanitized["s_time_local"].dt.tz_convert("UTC")
-    sanitized["s_time_utc"] = utc_series
+    local_index = sanitized.index.tz_convert(zone)
+    sanitized["s_time_local"] = local_index
+    sanitized["s_time_utc"] = local_index.tz_convert("UTC")
 
     if "dateutc" in sanitized.columns:
         sanitized["dateutc"] = pd.to_datetime(sanitized["dateutc"], errors="coerce", utc=True)
 
     if "epoch_ms" in sanitized.columns:
-        sanitized["epoch_ms"] = pd.to_numeric(sanitized["epoch_ms"], errors="coerce").astype("Int64")
+        sanitized["epoch_ms"] = (
+            pd.to_numeric(sanitized["epoch_ms"], errors="coerce").astype("Int64")
+        )
+    else:
+        sanitized["epoch_ms"] = (
+            sanitized["s_time_utc"].view("int64") // 1_000_000
+        ).astype("int64")
 
     drop_candidates = [
         "observed_at",
@@ -487,7 +505,9 @@ def sanitize_for_arrow(
         "timestamp_local",
         "timestamp_utc",
     ]
-    sanitized = sanitized.drop(columns=[c for c in drop_candidates if c in sanitized.columns], errors="ignore")
+    sanitized = sanitized.drop(
+        columns=[c for c in drop_candidates if c in sanitized.columns], errors="ignore"
+    )
 
     for column in sanitized.select_dtypes(include="object").columns:
         converted = pd.to_numeric(sanitized[column], errors="ignore")
@@ -498,8 +518,9 @@ def sanitize_for_arrow(
     if "mac" in sanitized.columns:
         sanitized["mac"] = sanitized["mac"].astype("string")
 
-    sanitized = sanitized.dropna(subset=["s_time_local"]).sort_values("s_time_local")
-    sanitized.reset_index(drop=True, inplace=True)
+    sanitized = sanitized.sort_index(kind="mergesort")
+    sanitized = ensure_time_column(sanitized)
+    sanitized = sanitized.dropna(subset=["s_time_local"]).reset_index(drop=True)
     return sanitized
 
 
@@ -525,26 +546,14 @@ def _compute_rainfall(window: pd.DataFrame) -> Tuple[float, Optional[str]]:
 def _metric_series(
     df: pd.DataFrame,
     metric_key: str,
-    zone: ZoneInfo,
+    tz_name: str,
     rule: Optional[str],
     agg: str,
 ) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=[metric_key])
 
-    working = df.copy()
-    if "s_time_local" in working.columns:
-        index = pd.to_datetime(working["s_time_local"], errors="coerce")
-    else:
-        index = pd.to_datetime(working.index, errors="coerce")
-
-    index = pd.DatetimeIndex(index)
-    if index.tz is None:
-        index = index.tz_localize(zone, ambiguous=False, nonexistent="shift_forward")
-    else:
-        index = index.tz_convert(zone)
-
-    working = working.assign(s_time_local=index).set_index("s_time_local")
+    working = ensure_time_index(df, tz_name)
 
     aliases = {
         "tempf": "temp_f",
@@ -589,8 +598,7 @@ def _metric_series_cached(
     agg: str,
 ) -> pd.DataFrame:
     del cache_key
-    zone = _get_zone(tz_name)
-    return _metric_series(df, metric_key, zone, rule, agg)
+    return _metric_series(df, metric_key, tz_name, rule, agg)
 
 
 def main() -> None:
@@ -643,8 +651,13 @@ def main() -> None:
 
     tz_name = str(config.get("timezone", {}).get("local_tz") or "UTC")
     df = _prepare_time_columns(df, tz_name)
+    df_time = ensure_time_index(df, tz_name)
 
-    latest_ts = df.index.max() if isinstance(df.index, pd.DatetimeIndex) else None
+    if df_time.empty:
+        st.info("No observations available to display yet.")
+        st.stop()
+
+    latest_ts = df_time.index.max() if not df_time.empty else None
 
     st.markdown(
         f"<style>body {{ background-color: {theme.background}; color: {theme.text}; }}"
@@ -704,6 +717,21 @@ def main() -> None:
                     break
             if found_metric:
                 break
+    if not found_metric:
+        for fallback in ("temp_f", "tempf", "temperature", "feels_like_f", "feelslike_f"):
+            for idx, (_, column) in enumerate(metric_options):
+                if column == fallback:
+                    default_index = idx
+                    found_metric = True
+                    break
+            if found_metric:
+                break
+
+    metric_state_key = "homesky_metric_label"
+    if metric_state_key in st.session_state and st.session_state[metric_state_key] in metric_labels:
+        default_index = metric_labels.index(st.session_state[metric_state_key])
+    else:
+        st.session_state[metric_state_key] = metric_labels[default_index]
 
     metric_state_key = "homesky_metric_label"
     if metric_state_key in st.session_state and st.session_state[metric_state_key] in metric_labels:
@@ -762,8 +790,8 @@ def main() -> None:
         st.session_state[fill_state_key] = fill_default
     fill_under_line = st.sidebar.checkbox("Fill under line", key=fill_state_key)
 
-    min_ts = df.index.min()
-    max_ts = df.index.max()
+    min_ts = df_time.index.min()
+    max_ts = df_time.index.max()
     default_end = max_ts
     default_start = max(default_end - timedelta(days=30), min_ts)
     date_state_key = "homesky_date_range"
@@ -803,10 +831,11 @@ def main() -> None:
     start_ts = max(requested_start, min_ts)
     end_ts = min(requested_end, max_ts)
 
-    mask = (df.index >= start_ts) & (df.index <= end_ts)
-    filtered = df.loc[mask].copy()
+    mask = (df_time.index >= start_ts) & (df_time.index <= end_ts)
+    filtered_time = df_time.loc[mask].copy()
+    filtered = ensure_time_column(filtered_time)
 
-    if filtered.empty:
+    if filtered_time.empty:
         st.toast("No data points in the chosen range.")
         st.info("No data available for the selected range/metric.")
         st.stop()
@@ -822,7 +851,7 @@ def main() -> None:
     )
     prepared = _metric_series_cached(
         chart_cache_key,
-        filtered,
+        filtered_time,
         metric_column,
         tz_name,
         resample_value,
@@ -855,11 +884,13 @@ def main() -> None:
             "<small>Rain metric: n/a</small>",
             unsafe_allow_html=True,
         )
-    stats_cols[4].metric("Last Observation", _format_timestamp(filtered.index.max(), tz_name))
+    stats_cols[4].metric(
+        "Last Observation", _format_timestamp(filtered_time.index.max(), tz_name)
+    )
 
     tz_abbr = tz_name
-    if isinstance(filtered.index, pd.DatetimeIndex) and len(filtered.index):
-        midpoint = filtered.index[int(len(filtered.index) * 0.5)]
+    if isinstance(filtered_time.index, pd.DatetimeIndex) and len(filtered_time.index):
+        midpoint = filtered_time.index[int(len(filtered_time.index) * 0.5)]
         try:
             localized_mid = midpoint.tz_convert(zone) if midpoint.tzinfo else midpoint.tz_localize(zone)
         except Exception:
@@ -898,7 +929,7 @@ def main() -> None:
     st.caption(f"Metric column: `{metric_column}`")
 
     st.subheader("Rain — Year to Date vs Normal")
-    daily_rain, daily_rain_column = _daily_rainfall(df)
+    daily_rain, daily_rain_column = _daily_rainfall(df_time)
     event_column = _resolve_column(df, "event_rain_in", "rain_event_in")
     normals_monthly, normals_error = _monthly_normals_from_config(config)
     if normals_error:
@@ -906,7 +937,7 @@ def main() -> None:
     if daily_rain.empty:
         st.info("No rain totals available. Add rain metrics to see cumulative comparisons.")
     else:
-        ytd_end = filtered.index.max()
+        ytd_end = filtered_time.index.max()
         start_of_year = pd.Timestamp(year=ytd_end.year, month=1, day=1, tz=zone)
         ytd_mask = (daily_rain.index >= start_of_year) & (
             daily_rain.index <= ytd_end.normalize()
@@ -973,7 +1004,7 @@ def main() -> None:
                     )
                     .properties(height=320)
                 )
-                events_df = _top_rain_events(df.loc[start_of_year:end_ts], event_column)
+                events_df = _top_rain_events(df_time.loc[start_of_year:end_ts], event_column)
                 if not events_df.empty:
                     events_df["date"] = events_df["s_time_local"].dt.floor("D")
                     events_df["cumulative"] = (
@@ -1020,7 +1051,7 @@ def main() -> None:
             yearly_rain = daily_rain.loc[
                 (daily_rain.index >= year_start) & (daily_rain.index <= year_stop)
             ]
-            yearly_df = df.loc[(df.index >= year_start) & (df.index <= year_stop)]
+            yearly_df = df_time.loc[(df_time.index >= year_start) & (df_time.index <= year_stop)]
 
             rain_cols = st.columns(2)
             with rain_cols[0]:
@@ -1031,7 +1062,7 @@ def main() -> None:
                     event_daily = pd.Series(False, index=yearly_rain.index)
                     if event_column:
                         event_series = (
-                            pd.to_numeric(df[event_column], errors="coerce").fillna(0.0)
+                            pd.to_numeric(df_time[event_column], errors="coerce").fillna(0.0)
                         )
                         event_daily_series = event_series.resample("D").max()
                         event_daily = event_daily_series.reindex(yearly_rain.index, fill_value=0) > 0
@@ -1098,8 +1129,8 @@ def main() -> None:
             if yearly_rain.empty:
                 st.info("No rain days to summarise for the selected year.")
             else:
-                temp_column = _resolve_column(df, "temp_f", "tempf", "temperature")
-                feels_column = _resolve_column(df, "feels_like_f", "feelslike_f")
+                temp_column = _resolve_column(df_time, "temp_f", "tempf", "temperature")
+                feels_column = _resolve_column(df_time, "feels_like_f", "feelslike_f")
                 top_days = yearly_rain.sort_values(ascending=False).head(10)
                 table_rows: List[Dict[str, str]] = []
                 temp_min = temp_max = temp_median = None
@@ -1141,20 +1172,21 @@ def main() -> None:
         format_func=lambda days: f"{days} days",
         key=band_window_key,
     )
-    band_end = filtered.index.max()
+    band_end = filtered_time.index.max()
     band_start = band_end - pd.Timedelta(days=band_days - 1)
-    band_mask = (filtered.index >= band_start) & (filtered.index <= band_end)
-    band_df = filtered.loc[band_mask]
+    band_mask = (filtered_time.index >= band_start) & (filtered_time.index <= band_end)
+    band_df_time = filtered_time.loc[band_mask]
+    band_df = ensure_time_column(band_df_time)
     temp_column = _resolve_column(band_df, "temp_f", "tempf", "temperature")
     feels_column = _resolve_column(band_df, "feels_like_f", "feelslike_f")
     if not temp_column:
         st.info("No temperature column available for band view.")
     else:
-        temp_series = pd.to_numeric(band_df[temp_column], errors="coerce")
+        temp_series = pd.to_numeric(band_df_time[temp_column], errors="coerce")
         daily_min = temp_series.resample("D").min()
         daily_max = temp_series.resample("D").max()
         if feels_column:
-            feels_series = pd.to_numeric(band_df[feels_column], errors="coerce")
+            feels_series = pd.to_numeric(band_df_time[feels_column], errors="coerce")
             daily_mean = feels_series.resample("D").mean()
         else:
             daily_mean = temp_series.resample("D").mean()
@@ -1216,9 +1248,9 @@ def main() -> None:
         mime="text/csv",
     )
 
-    value_columns = {column_name}
+    value_columns: List[str] = [column_name]
     if rain_column:
-        value_columns.add(rain_column)
+        value_columns.append(rain_column)
 
     sanitized = sanitize_for_arrow(filtered, tz_name=tz_name, value_columns=value_columns)
     parquet_buffer = BytesIO()
