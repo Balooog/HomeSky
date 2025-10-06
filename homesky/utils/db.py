@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from loguru import logger
@@ -175,7 +176,11 @@ class DatabaseManager:
         return int(row[0]) if row and row[0] is not None else None
 
     def read_dataframe(
-        self, mac: Optional[str] = None, limit: Optional[int] = None
+        self,
+        mac: Optional[str] = None,
+        limit: Optional[int] = None,
+        *,
+        local_tz: str | None = None,
     ) -> pd.DataFrame:
         query = "SELECT mac, obs_time_utc, obs_time_local, epoch, epoch_ms, data FROM observations"
         params: tuple = ()
@@ -226,6 +231,44 @@ class DatabaseManager:
             expanded["s_time_local"] = obs_time_local
         expanded["epoch_ms"] = expanded["epoch_ms"].astype("int64")
         expanded.index = observed_at
+        expanded.index.name = "s_time_utc"
+
+        tz_name = local_tz or "UTC"
+        try:
+            zone = ZoneInfo(tz_name)
+        except Exception:  # pragma: no cover - fallback to UTC
+            zone = ZoneInfo("UTC")
+
+        if "s_time_local" in expanded.columns:
+            local_series = pd.to_datetime(expanded["s_time_local"], errors="coerce")
+        else:
+            local_series = pd.to_datetime(expanded.index, errors="coerce")
+        if getattr(local_series.dtype, "tz", None) is None:
+            localized = local_series.dt.tz_localize(zone, ambiguous="NaT", nonexistent="shift_forward")
+            if localized.isna().any():
+                fallback = pd.Series(expanded.index, index=expanded.index).dt.tz_convert(zone)
+                localized = localized.where(~localized.isna(), fallback)
+            local_series = localized
+        else:
+            try:
+                local_series = local_series.dt.tz_convert(zone)
+            except Exception:
+                local_series = pd.Series(expanded.index, index=expanded.index).dt.tz_convert(zone)
+        expanded["s_time_local"] = local_series.values
+        expanded["s_time_utc"] = pd.Series(expanded.index, index=expanded.index)
+
+        if "observed_at" in expanded.columns:
+            expanded = expanded.drop(columns=["observed_at"])
+
+        if "s_time_local" in expanded.columns and "s_time_local" in expanded.index.names:
+            expanded = expanded.reset_index(drop=False)
+        if "s_time_local" not in expanded.columns:
+            expanded = expanded.reset_index(drop=False)
+            if "s_time_local" not in expanded.columns and "epoch_ms" in expanded.columns:
+                timestamps = pd.to_datetime(expanded["epoch_ms"], unit="ms", errors="coerce", utc=True)
+                expanded["s_time_local"] = timestamps.dt.tz_convert(zone)
+        expanded = expanded.drop_duplicates(subset=["s_time_local", "mac"], keep="last")
+        expanded = expanded.sort_values("s_time_local").set_index("s_time_local")
         return expanded
 
     # -- Parquet helpers ------------------------------------------------
