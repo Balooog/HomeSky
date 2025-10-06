@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from calendar import monthrange
-from datetime import timedelta
+from datetime import date, timedelta
 from io import BytesIO
 import hashlib
 from pathlib import Path
@@ -17,6 +17,7 @@ import streamlit as st
 
 import ingest
 from utils.derived import compute_all_derived
+from utils.logging import setup_streamlit_logging
 from utils.theming import get_theme, load_typography
 
 
@@ -138,6 +139,44 @@ def ensure_time_column(df: pd.DataFrame) -> pd.DataFrame:
             out = out.loc[:, ~out.columns.duplicated()]
         return out
     return df.copy()
+
+
+def _as_date(value: object, fallback: date) -> date:
+    if isinstance(value, date):
+        return value
+    try:
+        ts = pd.Timestamp(value)
+    except Exception:
+        return fallback
+    if pd.isna(ts):
+        return fallback
+    return ts.date()
+
+
+def get_date_range(
+    default_start: pd.Timestamp, default_end: pd.Timestamp, key: str = "homesky_date_range"
+) -> Tuple[date, date]:
+    """Initialize and return the stored date range for the dashboard controls."""
+
+    default_tuple = (default_start.date(), default_end.date())
+    if key not in st.session_state:
+        st.session_state[key] = default_tuple
+        return default_tuple
+
+    stored = st.session_state.get(key, default_tuple)
+    if isinstance(stored, (list, tuple)) and len(stored) == 2:
+        start_raw, end_raw = stored
+    else:
+        start_raw = stored
+        end_raw = stored
+
+    start_date = _as_date(start_raw, default_tuple[0])
+    end_date = _as_date(end_raw, default_tuple[1])
+    return start_date, end_date
+
+
+def _normalize_date_pair(start: date, end: date) -> Tuple[date, date]:
+    return (start, end) if start <= end else (end, start)
 
 
 def _safe_localize_day(value: pd.Timestamp | str, zone: ZoneInfo) -> pd.Timestamp:
@@ -629,6 +668,7 @@ def _metric_series_cached(
 
 
 def main() -> None:
+    setup_streamlit_logging()
     st.set_page_config(page_title="HomeSky", layout="wide")
     try:
         config = ingest.load_config()
@@ -772,6 +812,12 @@ def main() -> None:
     else:
         st.session_state[metric_state_key] = metric_labels[default_index]
 
+    metric_state_key = "homesky_metric_label"
+    if metric_state_key in st.session_state and st.session_state[metric_state_key] in metric_labels:
+        default_index = metric_labels.index(st.session_state[metric_state_key])
+    else:
+        st.session_state[metric_state_key] = metric_labels[default_index]
+
     metric_label = st.sidebar.selectbox(
         "Metric", metric_labels, index=default_index, key=metric_state_key
     )
@@ -828,12 +874,10 @@ def main() -> None:
     default_end = max_ts
     default_start = max(default_end - timedelta(days=30), min_ts)
     date_state_key = "homesky_date_range"
-    default_dates = (default_start.date(), default_end.date())
-    if date_state_key not in st.session_state:
-        st.session_state[date_state_key] = default_dates
+    default_dates = get_date_range(default_start, default_end, date_state_key)
     date_range = st.sidebar.date_input(
         "Date range",
-        value=st.session_state[date_state_key],
+        value=default_dates,
         min_value=min_ts.date(),
         max_value=max_ts.date(),
         key=date_state_key,
@@ -844,9 +888,11 @@ def main() -> None:
     else:
         start_date = date_range
         end_date = date_range
-    if start_date > end_date:
-        start_date, end_date = end_date, start_date
-    st.session_state[date_state_key] = (start_date, end_date)
+    start_date = _as_date(start_date, default_dates[0])
+    end_date = _as_date(end_date, default_dates[1])
+    start_date, end_date = _normalize_date_pair(start_date, end_date)
+    normalized_key = "_homesky_date_range_selected"
+    st.session_state[normalized_key] = (start_date, end_date)
 
     zone = _get_zone(tz_name)
     requested_start = _safe_localize_day(start_date, zone)
