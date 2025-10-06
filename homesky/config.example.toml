@@ -11,6 +11,11 @@ parquet_path = "./data/homesky.parquet"
 [timezone]
 local_tz = "America/New_York"
 
+[noaa]
+# Optional: configure a local normals dataset for rain comparisons.
+# station_id = "KXXX"         # optional ICAO or GHCND identifier for reference
+# normals_csv = "./data/noaa_normals.csv"  # 12-row monthly normals (inches or mm)
+
 [units]
 temperature = "F"  # F or C
 wind = "mph"       # mph or mps
