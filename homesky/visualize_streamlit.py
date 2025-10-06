@@ -784,6 +784,33 @@ def main() -> None:
                     break
             if found_metric:
                 break
+    if not found_metric:
+        for fallback in ("temp_f", "tempf", "temperature", "feels_like_f", "feelslike_f"):
+            for idx, (_, column) in enumerate(metric_options):
+                if column == fallback:
+                    default_index = idx
+                    found_metric = True
+                    break
+            if found_metric:
+                break
+
+    metric_state_key = "homesky_metric_label"
+    if metric_state_key in st.session_state and st.session_state[metric_state_key] in metric_labels:
+        default_index = metric_labels.index(st.session_state[metric_state_key])
+    else:
+        st.session_state[metric_state_key] = metric_labels[default_index]
+
+    metric_state_key = "homesky_metric_label"
+    if metric_state_key in st.session_state and st.session_state[metric_state_key] in metric_labels:
+        default_index = metric_labels.index(st.session_state[metric_state_key])
+    else:
+        st.session_state[metric_state_key] = metric_labels[default_index]
+
+    metric_state_key = "homesky_metric_label"
+    if metric_state_key in st.session_state and st.session_state[metric_state_key] in metric_labels:
+        default_index = metric_labels.index(st.session_state[metric_state_key])
+    else:
+        st.session_state[metric_state_key] = metric_labels[default_index]
 
     metric_state_key = "homesky_metric_label"
     if metric_state_key in st.session_state and st.session_state[metric_state_key] in metric_labels:
