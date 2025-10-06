@@ -64,54 +64,68 @@ def _get_zone(tz_name: str) -> ZoneInfo:
 
 
 def ensure_time_index(df: pd.DataFrame, tz_name: str) -> pd.DataFrame:
+    """Return a copy of *df* indexed by local time without column/index clashes."""
+
     if df.empty:
         return df.copy()
 
     working = df.copy()
     zone = _get_zone(tz_name)
 
-    if "s_time_local" in working.columns:
-        index_series = pd.to_datetime(working["s_time_local"], errors="coerce")
-        if getattr(index_series.dtype, "tz", None) is None:
-            try:
-                index_series = index_series.dt.tz_localize(
-                    zone, ambiguous="NaT", nonexistent="shift_forward"
-                )
-            except Exception:
-                index_series = index_series.dt.tz_localize(
-                    zone, ambiguous=True, nonexistent="shift_forward"
-                )
-        else:
-            try:
-                index_series = index_series.dt.tz_convert(zone)
-            except Exception:
-                index_series = index_series.dt.tz_localize(
-                    zone, ambiguous="NaT", nonexistent="shift_forward"
-                )
-    elif isinstance(working.index, pd.DatetimeIndex) and working.index.name == "s_time_local":
-        index_series = pd.DatetimeIndex(working.index)
-        if index_series.tz is None:
-            index_series = index_series.tz_localize(
+    utc_source: Optional[pd.Series] = None
+
+    if "obs_time_utc" in working.columns:
+        utc_source = pd.to_datetime(
+            working["obs_time_utc"], errors="coerce", utc=True
+        )
+    elif "epoch_ms" in working.columns:
+        epoch_series = pd.to_numeric(working["epoch_ms"], errors="coerce")
+        utc_source = pd.to_datetime(epoch_series, unit="ms", errors="coerce", utc=True)
+    elif "s_time_local" in working.columns:
+        local_series = pd.to_datetime(working["s_time_local"], errors="coerce")
+        if getattr(local_series.dt, "tz", None) is None:
+            localized = local_series.dt.tz_localize(
                 zone, ambiguous="NaT", nonexistent="shift_forward"
             )
         else:
-            index_series = index_series.tz_convert(zone)
-    elif "epoch_ms" in working.columns:
-        epoch_series = pd.to_numeric(working["epoch_ms"], errors="coerce")
-        index_series = pd.to_datetime(
-            epoch_series, unit="ms", errors="coerce", utc=True
-        )
-        index_series = index_series.dt.tz_convert(zone)
+            localized = local_series.dt.tz_convert(zone)
+        utc_source = localized.dt.tz_convert("UTC")
+    elif isinstance(working.index, pd.DatetimeIndex):
+        index_values = pd.Series(working.index, index=working.index)
+        if index_values.dt.tz is None:
+            localized = index_values.dt.tz_localize(
+                zone, ambiguous="NaT", nonexistent="shift_forward"
+            )
+        else:
+            localized = index_values.dt.tz_convert(zone)
+        utc_source = localized.dt.tz_convert("UTC")
     else:
-        raise ValueError("No time source found (need s_time_local or epoch_ms)")
+        raise ValueError(
+            "No recognizable time column: need obs_time_utc or epoch_ms or s_time_local"
+        )
 
-    mask = ~pd.isna(index_series)
+    if utc_source is None:
+        raise ValueError(
+            "No recognizable time column: need obs_time_utc or epoch_ms or s_time_local"
+        )
+
+    if not isinstance(utc_source, pd.Series):
+        utc_source = pd.Series(utc_source, index=working.index)
+
+    mask = utc_source.notna()
+    if not bool(mask.any()):
+        empty = working.iloc[0:0].copy()
+        empty.index = pd.DatetimeIndex([], tz=zone, name="s_time_local")
+        return empty
+
     working = working.loc[mask].copy()
-    index = pd.DatetimeIndex(index_series.loc[mask])
+    utc_valid = utc_source.loc[mask]
+    local_index = utc_valid.dt.tz_convert(zone)
+
     working = working.drop(columns=["s_time_local"], errors="ignore")
-    working.index = index
-    working = working.sort_index(kind="mergesort")
+    working.index = pd.DatetimeIndex(local_index.array)
     working.index.name = "s_time_local"
+    working = working.sort_index(kind="mergesort")
     return working
 
 
@@ -240,7 +254,7 @@ def _prepare_time_columns(df: pd.DataFrame, tz_name: str) -> pd.DataFrame:
     else:
         working["epoch_ms"] = (utc_index.view("int64") // 1_000_000).astype("int64")
 
-    return ensure_time_column(working)
+    return working
 
 
 def _latest_numeric(series: pd.Series) -> float:
@@ -483,19 +497,33 @@ def sanitize_for_arrow(
 
     zone = _get_zone(tz_name)
     local_index = sanitized.index.tz_convert(zone)
-    sanitized["s_time_local"] = local_index
-    sanitized["s_time_utc"] = local_index.tz_convert("UTC")
+    sanitized = sanitized.sort_index(kind="mergesort")
+    sanitized_reset = sanitized.reset_index()
 
-    if "dateutc" in sanitized.columns:
-        sanitized["dateutc"] = pd.to_datetime(sanitized["dateutc"], errors="coerce", utc=True)
-
-    if "epoch_ms" in sanitized.columns:
-        sanitized["epoch_ms"] = (
-            pd.to_numeric(sanitized["epoch_ms"], errors="coerce").astype("Int64")
+    local_series = pd.to_datetime(
+        sanitized_reset["s_time_local"], errors="coerce"
+    )
+    if getattr(local_series.dt, "tz", None) is None:
+        local_series = local_series.dt.tz_localize(
+            zone, ambiguous="NaT", nonexistent="shift_forward"
         )
     else:
-        sanitized["epoch_ms"] = (
-            sanitized["s_time_utc"].view("int64") // 1_000_000
+        local_series = local_series.dt.tz_convert(zone)
+    sanitized_reset["s_time_local"] = local_series
+    sanitized_reset["s_time_utc"] = local_series.dt.tz_convert("UTC")
+
+    if "dateutc" in sanitized_reset.columns:
+        sanitized_reset["dateutc"] = pd.to_datetime(
+            sanitized_reset["dateutc"], errors="coerce", utc=True
+        )
+
+    if "epoch_ms" in sanitized_reset.columns:
+        sanitized_reset["epoch_ms"] = pd.to_numeric(
+            sanitized_reset["epoch_ms"], errors="coerce"
+        ).astype("Int64")
+    else:
+        sanitized_reset["epoch_ms"] = (
+            sanitized_reset["s_time_utc"].view("int64") // 1_000_000
         ).astype("int64")
 
     drop_candidates = [
@@ -505,23 +533,22 @@ def sanitize_for_arrow(
         "timestamp_local",
         "timestamp_utc",
     ]
-    sanitized = sanitized.drop(
-        columns=[c for c in drop_candidates if c in sanitized.columns], errors="ignore"
+    sanitized_reset = sanitized_reset.drop(
+        columns=[c for c in drop_candidates if c in sanitized_reset.columns],
+        errors="ignore",
     )
 
-    for column in sanitized.select_dtypes(include="object").columns:
-        converted = pd.to_numeric(sanitized[column], errors="ignore")
-        sanitized[column] = converted
-        if sanitized[column].dtype == "object":
-            sanitized[column] = sanitized[column].astype("string")
+    for column in sanitized_reset.select_dtypes(include="object").columns:
+        converted = pd.to_numeric(sanitized_reset[column], errors="ignore")
+        sanitized_reset[column] = converted
+        if sanitized_reset[column].dtype == "object":
+            sanitized_reset[column] = sanitized_reset[column].astype("string")
 
-    if "mac" in sanitized.columns:
-        sanitized["mac"] = sanitized["mac"].astype("string")
+    if "mac" in sanitized_reset.columns:
+        sanitized_reset["mac"] = sanitized_reset["mac"].astype("string")
 
-    sanitized = sanitized.sort_index(kind="mergesort")
-    sanitized = ensure_time_column(sanitized)
-    sanitized = sanitized.dropna(subset=["s_time_local"]).reset_index(drop=True)
-    return sanitized
+    sanitized_reset = sanitized_reset.dropna(subset=["s_time_local"]).reset_index(drop=True)
+    return sanitized_reset
 
 
 def _compute_rainfall(window: pd.DataFrame) -> Tuple[float, Optional[str]]:
@@ -726,6 +753,12 @@ def main() -> None:
                     break
             if found_metric:
                 break
+
+    metric_state_key = "homesky_metric_label"
+    if metric_state_key in st.session_state and st.session_state[metric_state_key] in metric_labels:
+        default_index = metric_labels.index(st.session_state[metric_state_key])
+    else:
+        st.session_state[metric_state_key] = metric_labels[default_index]
 
     metric_state_key = "homesky_metric_label"
     if metric_state_key in st.session_state and st.session_state[metric_state_key] in metric_labels:
