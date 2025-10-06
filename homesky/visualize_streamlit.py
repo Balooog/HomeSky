@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from calendar import monthrange
 from datetime import date, timedelta
 from io import BytesIO
 import hashlib
+import math
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 import altair as alt
@@ -16,9 +16,10 @@ from pandas.api import types as ptypes
 import streamlit as st
 
 import ingest
+from rain_dashboard import compute_rainfall, render_rain_dashboard
 from utils.derived import compute_all_derived
 from utils.logging import setup_streamlit_logging
-from utils.theming import get_theme, load_typography
+from utils.theming import Theme, get_theme, load_typography
 
 
 MetricEntry = Tuple[str, Tuple[str, ...]]
@@ -57,6 +58,9 @@ RESAMPLE_UI: Sequence[Tuple[str, Optional[str], str]] = (
 AGGREGATE_OPTIONS: Sequence[str] = ("mean", "max", "min", "sum", "last")
 
 
+STREAMLIT_LOG_PATH = "data/logs/streamlit_error.log"
+
+
 def _get_zone(tz_name: str) -> ZoneInfo:
     try:
         return ZoneInfo(tz_name)
@@ -71,6 +75,14 @@ def ensure_time_index(df: pd.DataFrame, tz_name: str) -> pd.DataFrame:
         return df.copy()
 
     working = df.copy()
+    index_names: List[Optional[str]]
+    if isinstance(working.index, pd.MultiIndex):
+        index_names = list(working.index.names)
+    else:
+        index_names = [working.index.name]
+    if "s_time_local" in working.columns and "s_time_local" in index_names:
+        working = working.drop(columns=["s_time_local"], errors="ignore")
+
     zone = _get_zone(tz_name)
 
     utc_source: Optional[pd.Series] = None
@@ -341,175 +353,110 @@ def _format_stat_value(value: float, column: str) -> str:
     return f"{value:.2f}"
 
 
-def _coerce_month_number(value: object) -> Optional[int]:
-    try:
-        month_int = int(value)
-        if 1 <= month_int <= 12:
-            return month_int
-    except (TypeError, ValueError):
-        pass
-    try:
-        parsed = pd.to_datetime(str(value), errors="coerce")
-    except Exception:  # pragma: no cover - defensive guard
-        parsed = pd.NaT
-    if pd.isna(parsed):
-        return None
-    return int(parsed.month)
+def _is_pressure_column(column: str) -> bool:
+    return "press" in column.lower()
 
 
-def _monthly_normals_from_config(config: Dict) -> Tuple[Dict[int, float], Optional[str]]:
-    noaa_cfg = config.get("noaa", {})
-    normals_path = noaa_cfg.get("normals_csv")
-    if not normals_path:
-        return {}, None
-    path = Path(normals_path).expanduser()
-    if not path.exists():
-        return {}, f"Normals CSV not found at {path}"
-    try:
-        normals_df = pd.read_csv(path)
-    except Exception as exc:  # pragma: no cover - surface to UI
-        return {}, f"Unable to read NOAA normals: {exc}"
-    if normals_df.empty:
-        return {}, "Normals CSV is empty"
-    month_column = None
-    for candidate in normals_df.columns:
-        name = str(candidate).lower()
-        if name in {"month", "mon"}:
-            month_column = candidate
-            break
-    if month_column is None:
-        month_column = normals_df.columns[0]
-    value_candidates = [col for col in normals_df.columns if col != month_column]
-    if not value_candidates:
-        return {}, "Normals CSV is missing value columns"
-    preferred = None
-    for candidate in value_candidates:
-        lowered = str(candidate).lower()
-        if any(token in lowered for token in ("in", "inch", "rain")):
-            preferred = candidate
-            break
-    value_column = preferred or value_candidates[0]
-    values = pd.to_numeric(normals_df[value_column], errors="coerce")
-    months_raw = normals_df[month_column]
-    mapping: Dict[int, float] = {}
-    for month_raw, value in zip(months_raw, values):
-        month_number = _coerce_month_number(month_raw)
-        if month_number is None or pd.isna(value):
+def _init_widget_state(key: str, options: Sequence[Any], default_value: Any) -> Any:
+    if key not in st.session_state or st.session_state[key] not in options:
+        st.session_state[key] = default_value
+    return st.session_state[key]
+
+
+def _render_stat_card(
+    container: "st.delta_generator.DeltaGenerator",
+    *,
+    icon: str,
+    label: str,
+    value: str,
+    theme: Theme,
+    footnote: Optional[str] = None,
+) -> None:
+    footnote_html = (
+        f"<div style='font-size:0.72rem;color:{theme.muted_text};margin-top:0.35rem'>{footnote}</div>"
+        if footnote
+        else ""
+    )
+    container.markdown(
+        "<div style='display:flex;align-items:center;background:"
+        f"{theme.surface};border-radius:0.75rem;padding:0.85rem 1rem;box-shadow:0 8px 18px rgba(0,0,0,0.12);'>"
+        f"<div style='font-size:1.5rem;margin-right:0.85rem'>{icon}</div>"
+        "<div style='display:flex;flex-direction:column;'>"
+        f"<span style='font-size:0.85rem;text-transform:uppercase;color:{theme.muted_text};letter-spacing:0.08em'>{label}</span>"
+        f"<span style='font-size:1.55rem;font-weight:600;color:{theme.text};margin-top:0.2rem'>{value}</span>"
+        f"{footnote_html}"
+        "</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _metric_visual_style(metric_column: str, theme: Theme) -> Tuple[str, Optional[alt.Gradient]]:
+    if _is_temperature_column(metric_column):
+        gradient = alt.Gradient(
+            gradient="linear",
+            stops=[
+                alt.GradientStop(color="#2563eb", offset=0.0),
+                alt.GradientStop(color="#f8fafc", offset=0.5),
+                alt.GradientStop(color="#dc2626", offset=1.0),
+            ],
+            x1=0,
+            x2=0,
+            y1=1,
+            y2=0,
+        )
+        return "#f97316", gradient
+    if _is_rain_column(metric_column):
+        gradient = alt.Gradient(
+            gradient="linear",
+            stops=[
+                alt.GradientStop(color="#0f172a", offset=0.0),
+                alt.GradientStop(color="#1d4ed8", offset=0.4),
+                alt.GradientStop(color="#60a5fa", offset=1.0),
+            ],
+            x1=0,
+            x2=0,
+            y1=1,
+            y2=0,
+        )
+        return "#38bdf8", gradient
+    if _is_pressure_column(metric_column):
+        gradient = alt.Gradient(
+            gradient="linear",
+            stops=[
+                alt.GradientStop(color="#0e7490", offset=0.0),
+                alt.GradientStop(color="#cffafe", offset=0.7),
+                alt.GradientStop(color="#0891b2", offset=1.0),
+            ],
+            x1=0,
+            x2=0,
+            y1=1,
+            y2=0,
+        )
+        return "#06b6d4", gradient
+    return theme.primary, None
+
+
+def _infer_tz_abbreviation(index: pd.DatetimeIndex, zone: ZoneInfo) -> str:
+    if index.empty:
+        candidate = pd.Timestamp.now(tz=zone)
+        return candidate.tzname() or getattr(zone, "key", str(zone))
+    sample_points = [index[int(len(index) * frac)] for frac in (0.5, 0.0, 1.0)]
+    for point in sample_points:
+        try:
+            if point.tzinfo is None:
+                localized = point.tz_localize(zone, ambiguous="NaT", nonexistent="shift_forward")
+            else:
+                localized = point.tz_convert(zone)
+        except Exception:
             continue
-        mapping[int(month_number)] = float(value)
-    if not mapping:
-        return {}, "Normals CSV does not contain usable month totals"
-    unit_hint = str(value_column).lower()
-    if "mm" in unit_hint:
-        mapping = {month: amount / 25.4 for month, amount in mapping.items()}
-    else:
-        if max(mapping.values()) > 50:  # likely provided in millimetres
-            mapping = {month: amount / 25.4 for month, amount in mapping.items()}
-    return mapping, None
-
-
-def _daily_normals_for_year(
-    monthly_normals: Dict[int, float], year: int, zone: ZoneInfo
-) -> pd.Series:
-    if not monthly_normals:
-        return pd.Series(dtype="float64")
-    start = pd.Timestamp(year=year, month=1, day=1, tz=zone)
-    end = pd.Timestamp(year=year, month=12, day=31, tz=zone)
-    dates = pd.date_range(start=start, end=end, freq="D", tz=zone)
-    values: List[float] = []
-    for day in dates:
-        month_total = float(monthly_normals.get(day.month, 0.0))
-        days_in_month = monthrange(day.year, day.month)[1]
-        daily_value = month_total / days_in_month if days_in_month else 0.0
-        values.append(daily_value)
-    series = pd.Series(values, index=dates, dtype="float64")
-    series.name = "normal_in"
-    return series
-
-
-def _daily_rainfall(df: pd.DataFrame) -> Tuple[pd.Series, Optional[str]]:
-    if df.empty or not isinstance(df.index, pd.DatetimeIndex):
-        return pd.Series(dtype="float64"), None
-    column = _resolve_column(df, "daily_rain_in", "rain_day_in")
-    if column:
-        series = pd.to_numeric(df[column], errors="coerce")
-        daily = series.resample("D").max().fillna(0.0)
-        daily.name = column
-        return daily, column
-    column = _resolve_column(df, "event_rain_in", "rain_event_in")
-    if column:
-        series = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
-        daily = series.resample("D").sum(min_count=1).fillna(0.0)
-        daily.name = column
-        return daily, column
-    return pd.Series(dtype="float64"), None
-
-
-def _top_rain_events(
-    df: pd.DataFrame, column: Optional[str], limit: int = 5
-) -> pd.DataFrame:
-    if not column or df.empty or not isinstance(df.index, pd.DatetimeIndex):
-        return pd.DataFrame(columns=["s_time_local", "amount"])
-    series = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
-    if series.empty:
-        return pd.DataFrame(columns=["s_time_local", "amount"])
-    daily = series.resample("D").max().dropna()
-    daily = daily[daily > 0]
-    if daily.empty:
-        return pd.DataFrame(columns=["s_time_local", "amount"])
-    top = daily.sort_values(ascending=False).head(limit)
-    result = top.reset_index()
-    result.columns = ["s_time_local", "amount"]
-    return result
-
-
-def _rain_rate_histogram(df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[str]]:
-    column = _resolve_column(df, "rain_rate_in_hr", "rainrate_in_hr")
-    if not column:
-        return pd.DataFrame(columns=["bucket", "count"]), None
-    series = pd.to_numeric(df[column], errors="coerce").dropna()
-    if series.empty:
-        return pd.DataFrame(columns=["bucket", "count"]), column
-    bins = [0.0, 0.1, 0.25, 0.5, 1.0, 2.0, float("inf")]
-    labels = ["0–0.1", "0.1–0.25", "0.25–0.5", "0.5–1", "1–2", ">2"]
-    categorized = pd.cut(series, bins=bins, labels=labels, include_lowest=True, right=False)
-    counts = categorized.value_counts().sort_index()
-    histogram = counts.reset_index()
-    histogram.columns = ["bucket", "count"]
-    return histogram, column
-
-
-def _direction_to_cardinal(degrees: float) -> Optional[str]:
-    if pd.isna(degrees):
-        return None
-    directions = [
-        "N",
-        "NNE",
-        "NE",
-        "ENE",
-        "E",
-        "ESE",
-        "SE",
-        "SSE",
-        "S",
-        "SSW",
-        "SW",
-        "WSW",
-        "W",
-        "WNW",
-        "NW",
-        "NNW",
-    ]
-    idx = int((degrees % 360) / 22.5 + 0.5) % 16
-    return directions[idx]
-
-
-def _rain_24h(series: pd.Series) -> float:
-    numeric = pd.to_numeric(series, errors="coerce").dropna()
-    if numeric.empty:
-        return float("nan")
-    diffs = numeric.diff().clip(lower=0)
-    return float(diffs.sum(skipna=True))
+        abbr = localized.tzname()
+        if abbr:
+            return "ET" if abbr in {"EDT", "EST"} else abbr
+    fallback = pd.Timestamp.now(tz=zone)
+    abbr = fallback.tzname()
+    if abbr:
+        return "ET" if abbr in {"EDT", "EST"} else abbr
+    return getattr(zone, "key", str(zone))
 
 
 def sanitize_for_arrow(
@@ -590,25 +537,6 @@ def sanitize_for_arrow(
     return sanitized_reset
 
 
-def _compute_rainfall(window: pd.DataFrame) -> Tuple[float, Optional[str]]:
-    rain_column = _resolve_column(
-        window,
-        "rain_24h_in",
-        "rain_day_in",
-        "daily_rain_in",
-        "rain_event_in",
-        "rain_hour_in",
-        "rain_rate_in_hr",
-    )
-    if not rain_column:
-        return float("nan"), None
-    if rain_column == "rain_rate_in_hr":
-        rainfall = float(pd.to_numeric(window[rain_column], errors="coerce").fillna(0).sum())
-    else:
-        rainfall = _rain_24h(window[rain_column])
-    return rainfall, rain_column
-
-
 def _metric_series(
     df: pd.DataFrame,
     metric_key: str,
@@ -668,7 +596,7 @@ def _metric_series_cached(
 
 
 def main() -> None:
-    setup_streamlit_logging()
+    setup_streamlit_logging(STREAMLIT_LOG_PATH)
     st.set_page_config(page_title="HomeSky", layout="wide")
     try:
         config = ingest.load_config()
@@ -795,31 +723,14 @@ def main() -> None:
                 break
 
     metric_state_key = "homesky_metric_label"
-    if metric_state_key in st.session_state and st.session_state[metric_state_key] in metric_labels:
-        default_index = metric_labels.index(st.session_state[metric_state_key])
-    else:
-        st.session_state[metric_state_key] = metric_labels[default_index]
-
-    metric_state_key = "homesky_metric_label"
-    if metric_state_key in st.session_state and st.session_state[metric_state_key] in metric_labels:
-        default_index = metric_labels.index(st.session_state[metric_state_key])
-    else:
-        st.session_state[metric_state_key] = metric_labels[default_index]
-
-    metric_state_key = "homesky_metric_label"
-    if metric_state_key in st.session_state and st.session_state[metric_state_key] in metric_labels:
-        default_index = metric_labels.index(st.session_state[metric_state_key])
-    else:
-        st.session_state[metric_state_key] = metric_labels[default_index]
-
-    metric_state_key = "homesky_metric_label"
-    if metric_state_key in st.session_state and st.session_state[metric_state_key] in metric_labels:
-        default_index = metric_labels.index(st.session_state[metric_state_key])
-    else:
-        st.session_state[metric_state_key] = metric_labels[default_index]
-
+    selected_metric_label = _init_widget_state(
+        metric_state_key, metric_labels, metric_labels[default_index]
+    )
     metric_label = st.sidebar.selectbox(
-        "Metric", metric_labels, index=default_index, key=metric_state_key
+        "Metric",
+        metric_labels,
+        index=metric_labels.index(selected_metric_label),
+        key=metric_state_key,
     )
     metric_column = metric_lookup[metric_label]
 
@@ -831,14 +742,12 @@ def main() -> None:
     default_resample_key = configured_resample if configured_resample in resample_keys else "raw"
     resample_index = resample_keys.index(default_resample_key)
     resample_state_key = "homesky_resample"
-    if resample_state_key in st.session_state and st.session_state[resample_state_key] in resample_keys:
-        resample_index = resample_keys.index(st.session_state[resample_state_key])
-    else:
-        st.session_state[resample_state_key] = resample_keys[resample_index]
+    resample_default = resample_keys[resample_index]
+    current_resample = _init_widget_state(resample_state_key, resample_keys, resample_default)
     selected_resample_key = st.sidebar.selectbox(
         "Resample",
         options=resample_keys,
-        index=resample_index,
+        index=resample_keys.index(current_resample),
         format_func=lambda key: resample_labels.get(key, key),
         key=resample_state_key,
     )
@@ -851,19 +760,25 @@ def main() -> None:
         else 0
     )
     aggregate_state_key = "homesky_aggregate"
-    if (
-        aggregate_state_key in st.session_state
-        and st.session_state[aggregate_state_key] in AGGREGATE_OPTIONS
-    ):
-        aggregate_index = AGGREGATE_OPTIONS.index(st.session_state[aggregate_state_key])
-    else:
-        st.session_state[aggregate_state_key] = AGGREGATE_OPTIONS[aggregate_index]
+    aggregate_default = AGGREGATE_OPTIONS[aggregate_index]
+    current_aggregate = _init_widget_state(
+        aggregate_state_key, AGGREGATE_OPTIONS, aggregate_default
+    )
     aggregate = st.sidebar.selectbox(
-        "Aggregate", AGGREGATE_OPTIONS, index=aggregate_index, key=aggregate_state_key
+        "Aggregate",
+        AGGREGATE_OPTIONS,
+        index=AGGREGATE_OPTIONS.index(current_aggregate),
+        key=aggregate_state_key,
     )
 
     fill_state_key = "homesky_fill_under_line"
-    fill_default = _is_rain_column(metric_column)
+    fill_default = any(
+        (
+            _is_rain_column(metric_column),
+            _is_temperature_column(metric_column),
+            _is_pressure_column(metric_column),
+        )
+    )
     if st.session_state.get("_homesky_fill_metric") != metric_column:
         st.session_state["_homesky_fill_metric"] = metric_column
         st.session_state[fill_state_key] = fill_default
@@ -945,40 +860,49 @@ def main() -> None:
     column_name = prepared.columns[0]
     stats_series = prepared[column_name]
 
-    rain_total, rain_column = _compute_rainfall(filtered)
+    rain_total, rain_column = compute_rainfall(filtered)
     rain_display = _format_inches(rain_total)
 
     stats_cols = st.columns(5)
-    stats_cols[0].metric("Min", _format_stat_value(stats_series.min(), column_name))
-    stats_cols[1].metric("Mean", _format_stat_value(stats_series.mean(), column_name))
-    stats_cols[2].metric("Max", _format_stat_value(stats_series.max(), column_name))
-    stats_cols[3].metric("Rain Total", rain_display)
-    if rain_column:
-        stats_cols[3].markdown(
-            f"<small>Rain metric: <code>{rain_column}</code></small>",
-            unsafe_allow_html=True,
-        )
-    else:
-        stats_cols[3].markdown(
-            "<small>Rain metric: n/a</small>",
-            unsafe_allow_html=True,
-        )
-    stats_cols[4].metric(
-        "Last Observation", _format_timestamp(filtered_time.index.max(), tz_name)
+    _render_stat_card(
+        stats_cols[0],
+        icon="📉",
+        label="Min",
+        value=_format_stat_value(stats_series.min(), column_name),
+        theme=theme,
+    )
+    _render_stat_card(
+        stats_cols[1],
+        icon="📊",
+        label="Mean",
+        value=_format_stat_value(stats_series.mean(), column_name),
+        theme=theme,
+    )
+    _render_stat_card(
+        stats_cols[2],
+        icon="📈",
+        label="Max",
+        value=_format_stat_value(stats_series.max(), column_name),
+        theme=theme,
+    )
+    rain_footnote = f"Source: <code>{rain_column}</code>" if rain_column else "Source: n/a"
+    _render_stat_card(
+        stats_cols[3],
+        icon="🌧️",
+        label="Rain Total",
+        value=rain_display,
+        theme=theme,
+        footnote=rain_footnote,
+    )
+    _render_stat_card(
+        stats_cols[4],
+        icon="🕒",
+        label="Last Observation",
+        value=_format_timestamp(filtered_time.index.max(), tz_name),
+        theme=theme,
     )
 
-    tz_abbr = tz_name
-    if isinstance(filtered_time.index, pd.DatetimeIndex) and len(filtered_time.index):
-        midpoint = filtered_time.index[int(len(filtered_time.index) * 0.5)]
-        try:
-            localized_mid = midpoint.tz_convert(zone) if midpoint.tzinfo else midpoint.tz_localize(zone)
-        except Exception:
-            localized_mid = pd.Timestamp(midpoint).tz_localize(zone, ambiguous="NaT", nonexistent="shift_forward")
-            if pd.isna(localized_mid):
-                localized_mid = pd.Timestamp(midpoint).tz_localize(zone, ambiguous=True, nonexistent="shift_forward")
-        tz_candidate = localized_mid.tzname() if localized_mid is not None else None
-        if tz_candidate:
-            tz_abbr = tz_candidate
+    tz_abbr = _infer_tz_abbreviation(filtered_time.index, zone)
     axis_title = f"Time ({tz_abbr})"
 
     prepared_reset = prepared.reset_index()
@@ -990,255 +914,48 @@ def main() -> None:
         axis_kwargs["format"] = "%b"
         axis_kwargs["tickCount"] = 12
 
+    line_color, area_gradient = _metric_visual_style(metric_column, theme)
+    y_min = float(stats_series.min(skipna=True))
+    y_max = float(stats_series.max(skipna=True))
+    scale_kwargs: Dict[str, object] = {"zero": False, "nice": True}
+    if math.isfinite(y_min) and math.isfinite(y_max):
+        if y_min == y_max:
+            padding = max(abs(y_min) * 0.05, 1.0)
+            scale_kwargs["domain"] = [y_min - padding, y_max + padding]
+        else:
+            padding = max((y_max - y_min) * 0.08, 0.5)
+            scale_kwargs["domain"] = [y_min - padding, y_max + padding]
+
     base_chart = alt.Chart(prepared_reset).encode(
         x=alt.X("s_time_local:T", axis=alt.Axis(**axis_kwargs)),
-        y=alt.Y(f"{column_name}:Q", title=metric_label, scale=alt.Scale(zero=False, nice=True)),
+        y=alt.Y(f"{column_name}:Q", title=metric_label, scale=alt.Scale(**scale_kwargs)),
         tooltip=[
             alt.Tooltip("s_time_local:T", title="Time"),
             alt.Tooltip(f"{column_name}:Q", title=metric_label),
         ],
     )
-    line_chart = base_chart.mark_line(point=False)
+    line_chart = base_chart.mark_line(color=line_color, strokeWidth=2.5, point=False)
     if fill_under_line:
-        area_chart = base_chart.mark_area(opacity=0.25)
+        area_color = area_gradient if area_gradient is not None else line_color
+        area_chart = base_chart.mark_area(color=area_color, opacity=0.55)
         chart = (area_chart + line_chart).properties(height=320).interactive()
     else:
         chart = line_chart.properties(height=320).interactive()
     st.altair_chart(chart, use_container_width=True)
     st.caption(f"Metric column: `{metric_column}`")
 
-    st.subheader("Rain — Year to Date vs Normal")
-    daily_rain, daily_rain_column = _daily_rainfall(df_time)
-    event_column = _resolve_column(df, "event_rain_in", "rain_event_in")
-    normals_monthly, normals_error = _monthly_normals_from_config(config)
-    if normals_error:
-        st.warning(normals_error)
-    if daily_rain.empty:
-        st.info("No rain totals available. Add rain metrics to see cumulative comparisons.")
-    else:
-        ytd_end = filtered_time.index.max()
-        start_of_year = pd.Timestamp(year=ytd_end.year, month=1, day=1, tz=zone)
-        ytd_mask = (daily_rain.index >= start_of_year) & (
-            daily_rain.index <= ytd_end.normalize()
-        )
-        ytd_daily = daily_rain.loc[ytd_mask]
-        if ytd_daily.empty:
-            st.info("No rainfall recorded for the selected year yet.")
-        else:
-            actual_total = float(ytd_daily.sum())
-            normals_series = (
-                _daily_normals_for_year(normals_monthly, ytd_end.year, zone)
-                if normals_monthly
-                else pd.Series(dtype="float64")
-            )
-            normal_total = float("nan")
-            normal_cumulative = None
-            if not normals_series.empty:
-                normals_to_date = normals_series.loc[: ytd_end.normalize()]
-                normal_total = float(normals_to_date.sum())
-                normal_cumulative = normals_to_date.reindex(ytd_daily.index, fill_value=0).cumsum()
-            actual_cumulative = ytd_daily.cumsum()
-
-            rain_cards = st.columns(3)
-            rain_cards[0].metric("YTD total", _format_inches(actual_total))
-            if normal_cumulative is not None:
-                rain_cards[1].metric("Normal to date", _format_inches(normal_total))
-                departure = actual_total - normal_total
-                departure_color = "#2e8540" if departure >= 0 else "#b31b1b"
-                rain_cards[2].markdown(
-                    "<div style='padding:0.5rem;border-radius:0.5rem;text-align:center;"
-                    f"background-color:{departure_color};color:white;font-weight:600;'>"
-                    f"Departure {departure:+.1f} in"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-            else:
-                rain_cards[1].info("Add NOAA normals to compare (see Settings)")
-                rain_cards[2].empty()
-
-            ytd_records: List[Dict[str, object]] = []
-            for date, value in actual_cumulative.items():
-                ytd_records.append({"date": date, "Series": "Actual", "value": value})
-            if normal_cumulative is not None:
-                for date, value in normal_cumulative.items():
-                    ytd_records.append({"date": date, "Series": "Normal", "value": value})
-            ytd_chart_df = pd.DataFrame(ytd_records)
-            if not ytd_chart_df.empty:
-                ytd_chart = (
-                    alt.Chart(ytd_chart_df)
-                    .mark_line(point=True)
-                    .encode(
-                        x=alt.X("date:T", axis=alt.Axis(title="Date")),
-                        y=alt.Y(
-                            "value:Q",
-                            title="Cumulative rain (in)",
-                            scale=alt.Scale(nice=True),
-                        ),
-                        color=alt.Color("Series:N", title="Series"),
-                        tooltip=[
-                            alt.Tooltip("date:T", title="Date"),
-                            alt.Tooltip("value:Q", title="Rain (in)"),
-                            alt.Tooltip("Series:N", title="Series"),
-                        ],
-                    )
-                    .properties(height=320)
-                )
-                events_df = _top_rain_events(df_time.loc[start_of_year:end_ts], event_column)
-                if not events_df.empty:
-                    events_df["date"] = events_df["s_time_local"].dt.floor("D")
-                    events_df["cumulative"] = (
-                        actual_cumulative.reindex(events_df["date"], method="ffill").to_numpy()
-                    )
-                    events_layer = (
-                        alt.Chart(events_df)
-                        .mark_point(size=80, color=theme.accent)
-                        .encode(
-                            x="date:T",
-                            y="cumulative:Q",
-                            tooltip=[
-                                alt.Tooltip("date:T", title="Event"),
-                                alt.Tooltip("amount:Q", title="Rain (in)"),
-                            ],
-                        )
-                    )
-                    ytd_chart = ytd_chart + events_layer
-                st.altair_chart(ytd_chart, use_container_width=True)
-            rain_caption_source = daily_rain_column or event_column or "n/a"
-            if rain_caption_source == "n/a":
-                st.caption("Rain column: n/a")
-            else:
-                st.caption(f"Rain column: `{rain_caption_source}`")
-
-            year_options = sorted(daily_rain.index.year.unique().tolist())
-            rain_year_key = "homesky_rain_year"
-            default_year = int(ytd_end.year)
-            if (
-                rain_year_key not in st.session_state
-                or st.session_state[rain_year_key] not in year_options
-            ):
-                fallback_year = default_year if default_year in year_options else year_options[-1]
-                st.session_state[rain_year_key] = fallback_year
-            year_index = year_options.index(st.session_state[rain_year_key])
-            selected_year = st.selectbox(
-                "Rain year",
-                year_options,
-                index=year_index,
-                key=rain_year_key,
-            )
-            year_start = pd.Timestamp(year=selected_year, month=1, day=1, tz=zone)
-            year_stop = pd.Timestamp(year=selected_year, month=12, day=31, tz=zone)
-            yearly_rain = daily_rain.loc[
-                (daily_rain.index >= year_start) & (daily_rain.index <= year_stop)
-            ]
-            yearly_df = df_time.loc[(df_time.index >= year_start) & (df_time.index <= year_stop)]
-
-            rain_cols = st.columns(2)
-            with rain_cols[0]:
-                st.markdown("**Monthly totals**")
-                if yearly_rain.empty:
-                    st.info("No rainfall recorded for the selected year.")
-                else:
-                    event_daily = pd.Series(False, index=yearly_rain.index)
-                    if event_column:
-                        event_series = (
-                            pd.to_numeric(df_time[event_column], errors="coerce").fillna(0.0)
-                        )
-                        event_daily_series = event_series.resample("D").max()
-                        event_daily = event_daily_series.reindex(yearly_rain.index, fill_value=0) > 0
-                    monthly_frame = pd.DataFrame(
-                        {
-                            "date": yearly_rain.index,
-                            "rain": yearly_rain.values,
-                            "category": [
-                                "Event day" if flag else "Other day" for flag in event_daily
-                            ],
-                        }
-                    )
-                    monthly_frame["month"] = (
-                        monthly_frame["date"].dt.to_period("M").dt.to_timestamp()
-                    )
-                    monthly_totals = (
-                        monthly_frame.groupby(["month", "category"], as_index=False)["rain"].sum()
-                    )
-                    month_chart = (
-                        alt.Chart(monthly_totals)
-                        .mark_bar()
-                        .encode(
-                            x=alt.X("month:T", axis=alt.Axis(title="Month", format="%b")),
-                            y=alt.Y("rain:Q", axis=alt.Axis(title="Rain (in)")),
-                            color=alt.Color("category:N", title="Day type"),
-                            tooltip=[
-                                alt.Tooltip("month:T", title="Month"),
-                                alt.Tooltip("rain:Q", title="Rain (in)"),
-                                alt.Tooltip("category:N", title="Day type"),
-                            ],
-                        )
-                        .properties(height=280)
-                    )
-                    st.altair_chart(month_chart, use_container_width=True)
-
-            with rain_cols[1]:
-                st.markdown("**Hourly intensity**")
-                hist_df, hist_column = _rain_rate_histogram(yearly_df)
-                if hist_df.empty:
-                    st.info("No rain rate observations for this year.")
-                else:
-                    hist_chart = (
-                        alt.Chart(hist_df)
-                        .mark_bar()
-                        .encode(
-                            x=alt.X(
-                                "bucket:N",
-                                title="Rain rate (in/hr)",
-                                sort=list(hist_df["bucket"]),
-                            ),
-                            y=alt.Y("count:Q", title="Hours"),
-                            tooltip=[
-                                alt.Tooltip("bucket:N", title="Rain rate"),
-                                alt.Tooltip("count:Q", title="Hours"),
-                            ],
-                        )
-                        .properties(height=280)
-                    )
-                    st.altair_chart(hist_chart, use_container_width=True)
-                    if hist_column:
-                        st.caption(f"Intensity column: `{hist_column}`")
-
-            st.markdown("**Biggest rain days**")
-            if yearly_rain.empty:
-                st.info("No rain days to summarise for the selected year.")
-            else:
-                temp_column = _resolve_column(df_time, "temp_f", "tempf", "temperature")
-                feels_column = _resolve_column(df_time, "feels_like_f", "feelslike_f")
-                top_days = yearly_rain.sort_values(ascending=False).head(10)
-                table_rows: List[Dict[str, str]] = []
-                temp_min = temp_max = temp_median = None
-                if temp_column:
-                    temp_series = pd.to_numeric(yearly_df[temp_column], errors="coerce")
-                    temp_min = temp_series.resample("D").min()
-                    temp_max = temp_series.resample("D").max()
-                    temp_median = temp_series.resample("D").median()
-                if feels_column:
-                    feels_series = pd.to_numeric(yearly_df[feels_column], errors="coerce")
-                    temp_median = feels_series.resample("D").median()
-                for date, amount in top_days.items():
-                    min_val = temp_min.loc[date] if temp_min is not None and date in temp_min.index else float("nan")
-                    max_val = temp_max.loc[date] if temp_max is not None and date in temp_max.index else float("nan")
-                    median_val = (
-                        temp_median.loc[date]
-                        if temp_median is not None and date in temp_median.index
-                        else float("nan")
-                    )
-                    table_rows.append(
-                        {
-                            "Date": date.strftime("%Y-%m-%d"),
-                            "Rain (in)": _format_inches(amount),
-                            "Min temp": _format_temperature(min_val),
-                            "Median temp": _format_temperature(median_val),
-                            "Max temp": _format_temperature(max_val),
-                        }
-                    )
-                st.dataframe(pd.DataFrame(table_rows), use_container_width=True)
+    render_rain_dashboard(
+        df_full=df,
+        df_time=df_time,
+        filtered_time=filtered_time,
+        end_ts=end_ts,
+        config=config,
+        zone=zone,
+        theme=theme,
+        format_inches=_format_inches,
+        format_temperature=_format_temperature,
+        rain_metric=rain_column,
+    )
 
     st.subheader("Daily temperature bands")
     band_window_key = "homesky_temp_band_window"
