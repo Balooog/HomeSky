@@ -19,7 +19,8 @@ git reset --hard origin/main
 .\tools\ensure_venv_and_deps.ps1
 .\tools\ensure_config.ps1
 
-python .\homesky\gui.py
+# Preferred launcher keeps imports stable across environments.
+python -m homesky.gui
 # Test Build Complete
 ```
 
@@ -31,6 +32,12 @@ python .\homesky\gui.py
 
 ```pwsh
 notepad .\homesky\config.toml
+python -m homesky.gui
+```
+
+You can also execute the file directly (the launcher bootstraps the repo root on the path):
+
+```pwsh
 python .\homesky\gui.py
 ```
 

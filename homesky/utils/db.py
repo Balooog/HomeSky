@@ -16,6 +16,8 @@ from homesky.utils.logging_setup import get_logger
 
 log = get_logger("db")
 
+STATION_TZ = "America/New_York"  # TODO: make configurable via config
+
 
 def _json_default(value: object) -> Optional[object]:
     """Return a JSON-serializable representation for database payloads."""
@@ -79,15 +81,22 @@ def parse_obs_times(df: pd.DataFrame) -> pd.DataFrame:
 
     working = df.copy()
     try:
-        working["obs_time_local"] = pd.to_datetime(
-            working["obs_time_local"], utc=True, errors="coerce"
-        )
-        working["obs_time_local"] = working["obs_time_local"].dt.tz_convert(
-            "America/New_York"
-        )
+        ts = pd.to_datetime(working["obs_time_local"], errors="coerce", utc=False)
+
+        tz_attr = getattr(ts.dt, "tz", None)
+        if tz_attr is None:
+            ts = ts.dt.tz_localize(
+                STATION_TZ,
+                nonexistent="shift_forward",
+                ambiguous="NaT",
+            )
+        else:
+            ts = ts.dt.tz_convert(STATION_TZ)
+
+        working["obs_time_local"] = ts
         working = working.drop_duplicates(subset=["obs_time_local"])
     except Exception as exc:  # pragma: no cover - defensive logging only
-        log.error("Datetime parse failed: %s", exc)
+        log.exception("parse_obs_times failed: %s", exc)
     return working
 
 
