@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from loguru import logger
+
+from homesky.utils.logging_setup import get_logger
 
 from utils.ambient import AmbientClient
 from utils.config import (
@@ -41,6 +41,9 @@ root_dir = "./data"
 sqlite_path = "./data/homesky.sqlite"
 parquet_path = "./data/homesky.parquet"
 """
+
+
+log = get_logger("ingest")
 
 
 def _split_comment(segment: str) -> Tuple[str, str]:
@@ -129,14 +132,14 @@ def _backup_and_restore(candidate: Path) -> None:
     try:
         if candidate.exists():
             backup_path.write_bytes(candidate.read_bytes())
-            logger.warning("Existing config backed up to {}", backup_path)
+            log.warning("Existing config backed up to %s", backup_path)
     except OSError as exc:
-        logger.warning("Unable to write backup config at {}: {}", backup_path, exc)
+        log.warning("Unable to write backup config at %s: %s", backup_path, exc)
     try:
         ensure_parent_directory(candidate)
         candidate.write_text(_template_text(), encoding="utf-8")
     except OSError as exc:
-        logger.error("Failed to write fresh config template at {}: {}", candidate, exc)
+        log.error("Failed to write fresh config template at %s: %s", candidate, exc)
         raise
 
 
@@ -155,9 +158,9 @@ def ensure_config(path: Path | None = None) -> Path:
     try:
         target.write_text(_template_text(), encoding="utf-8")
     except OSError as exc:
-        logger.error("Failed to create configuration at {}: {}", target, exc)
+        log.error("Failed to create configuration at %s: %s", target, exc)
         raise
-    logger.info("Created starter configuration at {}", target)
+    log.info("Created starter configuration at %s", target)
     return target
 
 
@@ -169,7 +172,7 @@ def load_config(path: Path | None = None) -> Dict:
         try:
             ensure_config(get_config_path())
         except OSError:
-            logger.warning("Unable to ensure external configuration exists")
+            log.warning("Unable to ensure external configuration exists")
     candidates = [path] if path else candidate_config_paths()
     preferred_external = external_config_path()
     last_error: Exception | None = None
@@ -188,17 +191,18 @@ def load_config(path: Path | None = None) -> Dict:
             try:
                 raw = candidate.read_bytes()
             except OSError as exc:
-                logger.error("Unable to read config at {}: {}", candidate, exc)
+                log.error("Unable to read config at %s: %s", candidate, exc)
                 last_error = exc
                 break
             try:
                 normalized, changed = _normalize_config_bytes(raw)
             except UnicodeDecodeError as exc:
-                logger.error("Config at {} is not valid UTF-8: {}", candidate, exc)
+                log.error("Config at %s is not valid UTF-8: %s", candidate, exc)
                 last_error = exc
                 if is_external and attempts == 1:
-                    logger.warning(
-                        "Attempting to restore {} from template due to invalid encoding.", candidate
+                    log.warning(
+                        "Attempting to restore %s from template due to invalid encoding.",
+                        candidate,
                     )
                     _backup_and_restore(candidate)
                     repaired_candidate = True
@@ -207,18 +211,18 @@ def load_config(path: Path | None = None) -> Dict:
             if changed:
                 try:
                     candidate.write_text(normalized, encoding="utf-8")
-                    logger.info("Normalized config formatting at {}", candidate)
+                    log.info("Normalized config formatting at %s", candidate)
                 except OSError as exc:
-                    logger.warning("Failed to write normalized config at {}: {}", candidate, exc)
+                    log.warning("Failed to write normalized config at %s: %s", candidate, exc)
                 normalized_any = True
             try:
                 config = tomllib.loads(normalized)
             except tomllib.TOMLDecodeError as exc:
-                logger.error("Failed to parse config at {}: {}", candidate, exc)
+                log.error("Failed to parse config at %s: %s", candidate, exc)
                 last_error = exc
                 if is_external and attempts == 1:
-                    logger.warning(
-                        "Attempting to restore {} from template; previous version saved to config.bak.",
+                    log.warning(
+                        "Attempting to restore %s from template; previous version saved to config.bak.",
                         candidate,
                     )
                     try:
@@ -245,21 +249,11 @@ load_config.last_was_repaired = False  # type: ignore[attr-defined]
 load_config.last_was_normalized = False  # type: ignore[attr-defined]
 
 
-def setup_logging(config: Dict) -> None:
-    log_path = Path(config.get("ingest", {}).get("log_path", "./data/logs/ingest.log"))
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    rotation_days = config.get("ingest", {}).get("log_rotate_days", 14)
-    logger.remove()
-    logger.add(sys.stderr, level="INFO")
-    logger.add(
-        log_path,
-        rotation=f"{rotation_days} days",
-        retention=f"{rotation_days * 2} days",
-        level="DEBUG",
-        backtrace=True,
-        enqueue=True,
-    )
-    logger.info("Logging initialized at {}", log_path)
+def setup_logging(config: Dict | None = None):  # pragma: no cover - compatibility shim
+    """Initialize ingest logging once and return the shared logger."""
+
+    del config
+    return log
 
 
 def get_storage_manager(config: Dict) -> StorageManager:
@@ -418,7 +412,7 @@ def is_first_run(db: DatabaseManager) -> bool:
     except FileNotFoundError:
         return True
     except Exception as exc:  # pragma: no cover - defensive logging
-        logger.warning("Unable to determine first-run status: {}", exc)
+        log.warning("Unable to determine first-run status: %s", exc)
         return False
     return snapshot.empty
 
@@ -465,11 +459,11 @@ def maybe_auto_backfill(config: Dict, storage: StorageManager) -> None:
     try:
         from backfill import backfill_range
     except ImportError:
-        logger.warning("Backfill module unavailable; skipping automatic backfill")
+        log.warning("Backfill module unavailable; skipping automatic backfill")
         return
     mac = config.get("ambient", {}).get("mac") or None
     if not mac:
-        logger.warning("Cannot run automatic backfill without a configured MAC address")
+        log.warning("Cannot run automatic backfill without a configured MAC address")
         return
     end = pd.Timestamp.utcnow().tz_localize("UTC")
     start = end - pd.Timedelta(hours=hours)
@@ -483,17 +477,17 @@ def maybe_auto_backfill(config: Dict, storage: StorageManager) -> None:
             limit_per_call=ingest_cfg.get("backfill_limit", 288),
         )
     except Exception as exc:  # pragma: no cover - log and continue ingestion
-        logger.warning("First-run backfill failed: {}", exc)
+        log.warning("First-run backfill failed: %s", exc)
         return
     if result.inserted:
-        logger.info(
+        log.info(
             "First-run backfill added %s rows (%s to %s)",
             result.inserted,
             result.start,
             result.end,
         )
     else:
-        logger.info("First-run backfill found no additional rows")
+        log.info("First-run backfill found no additional rows")
 
 
 def ingest_once(config: Dict, storage: StorageManager) -> StorageResult:
@@ -517,18 +511,18 @@ def ingest_once(config: Dict, storage: StorageManager) -> StorageResult:
         enabled=config.get("ingest", {}).get("deduplicate_by_timestamp", True),
     )
     if canonical.empty:
-        logger.info("No new observations to ingest.")
+        log.info("No new observations to ingest.")
         return StorageResult(0, None, None)
     result = storage.upsert_canonical(canonical)
     if result.inserted:
-        logger.info(
+        log.info(
             "Ingested %s new observation rows (%s to %s)",
             result.inserted,
             result.start,
             result.end,
         )
     else:
-        logger.info("No new observations to ingest.")
+        log.info("No new observations to ingest.")
     return result
 
 
@@ -538,14 +532,18 @@ def run_loop(config: Dict, storage: StorageManager) -> None:
         try:
             result = ingest_once(config, storage)
         except KeyboardInterrupt:
-            logger.info("Ingest loop interrupted by user")
+            log.info("Ingest loop interrupted by user")
             raise
         except Exception as exc:  # pragma: no cover
-            logger.exception("Ingest failed: {}", exc)
+            log.exception("Ingest failed: %s", exc)
         else:
             if result.inserted:
-                poll_seconds = detect_cadence_seconds(storage.database.read_dataframe(limit=10))
-        logger.info("Sleeping for {} seconds", poll_seconds)
+                poll_seconds = detect_cadence_seconds(
+                    storage.database.read_dataframe(limit=10)
+                )
+            else:
+                poll_seconds = 60
+        log.info("Sleeping for %s seconds", poll_seconds)
         time.sleep(poll_seconds)
 
 
@@ -559,7 +557,7 @@ def main() -> None:
     args = parse_args()
     config = load_config()
     setup_logging(config)
-    logger.info("Starting HomeSky ingest service")
+    log.info("Starting HomeSky ingest service")
     storage = get_storage_manager(config)
     try:
         maybe_auto_backfill(config, storage)
@@ -568,7 +566,7 @@ def main() -> None:
         else:
             run_loop(config, storage)
     except KeyboardInterrupt:
-        logger.info("Shutdown requested. Exiting.")
+        log.info("Shutdown requested. Exiting.")
 
 
 if __name__ == "__main__":
