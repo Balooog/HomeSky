@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 from datetime import date, timedelta
 from io import BytesIO
 import hashlib
@@ -14,11 +15,13 @@ import altair as alt
 import pandas as pd
 from pandas.api import types as ptypes
 import streamlit as st
+import traceback
 
 import ingest
 from rain_dashboard import compute_rainfall, render_rain_dashboard
 from utils.derived import compute_all_derived
 from utils.logging import setup_streamlit_logging
+from utils.logging_setup import get_logger
 from utils.theming import Theme, get_theme, load_typography
 
 
@@ -49,16 +52,20 @@ RESAMPLE_UI: Sequence[Tuple[str, Optional[str], str]] = (
     ("raw", None, "Raw"),
     ("5min", "5min", "5 minutes"),
     ("15min", "15min", "15 minutes"),
-    ("H", "H", "Hourly"),
-    ("D", "D", "Daily"),
-    ("W", "W", "Weekly"),
-    ("M", "M", "Monthly"),
+    ("H", "h", "Hourly"),
+    ("D", "d", "Daily"),
+    ("W", "w", "Weekly"),
+    ("M", "m", "Monthly"),
 )
 
 AGGREGATE_OPTIONS: Sequence[str] = ("mean", "max", "min", "sum", "last")
 
 
-STREAMLIT_LOG_PATH = "data/logs/streamlit_error.log"
+STREAMLIT_LOG_PATH = Path("data/logs/streamlit_error.log")
+RERUN_SENTINEL_KEY = "homesky_rerun_pending"
+
+
+log = get_logger("streamlit")
 
 
 def _get_zone(tz_name: str) -> ZoneInfo:
@@ -95,13 +102,10 @@ def ensure_time_index(df: pd.DataFrame, tz_name: str) -> pd.DataFrame:
         epoch_series = pd.to_numeric(working["epoch_ms"], errors="coerce")
         utc_source = pd.to_datetime(epoch_series, unit="ms", errors="coerce", utc=True)
     elif "s_time_local" in working.columns:
-        local_series = pd.to_datetime(working["s_time_local"], errors="coerce")
-        if getattr(local_series.dt, "tz", None) is None:
-            localized = local_series.dt.tz_localize(
-                zone, ambiguous="NaT", nonexistent="shift_forward"
-            )
-        else:
-            localized = local_series.dt.tz_convert(zone)
+        local_series = pd.to_datetime(
+            working["s_time_local"], errors="coerce", utc=True
+        )
+        localized = local_series.dt.tz_convert(zone)
         utc_source = localized.dt.tz_convert("UTC")
     elif isinstance(working.index, pd.DatetimeIndex):
         index_values = pd.Series(working.index, index=working.index)
@@ -189,6 +193,34 @@ def get_date_range(
 
 def _normalize_date_pair(start: date, end: date) -> Tuple[date, date]:
     return (start, end) if start <= end else (end, start)
+
+
+def _record_streamlit_error(exc: BaseException) -> None:
+    """Append structured crash details to the Streamlit error log."""
+
+    STREAMLIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now().isoformat()
+    with STREAMLIT_LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{timestamp}] {type(exc).__name__}: {exc}\n")
+        handle.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+        handle.write("\n")
+
+
+def _trigger_streamlit_rerun() -> None:
+    """Trigger a rerun without entering repeated reset loops."""
+
+    if st.session_state.get(RERUN_SENTINEL_KEY):
+        log.debug("Rerun already pending; skipping duplicate trigger")
+        return
+    st.session_state[RERUN_SENTINEL_KEY] = True
+    try:
+        st.rerun()
+    except AttributeError as exc:
+        log.warning("st.rerun() unavailable; attempting experimental fallback: %s", exc)
+        if hasattr(st, "experimental_rerun"):
+            st.experimental_rerun()
+        else:  # pragma: no cover - defensive guard for unexpected Streamlit API changes
+            raise
 
 
 def _safe_localize_day(value: pd.Timestamp | str, zone: ZoneInfo) -> pd.Timestamp:
@@ -487,14 +519,8 @@ def sanitize_for_arrow(
     sanitized_reset = sanitized.reset_index()
 
     local_series = pd.to_datetime(
-        sanitized_reset["s_time_local"], errors="coerce"
-    )
-    if getattr(local_series.dt, "tz", None) is None:
-        local_series = local_series.dt.tz_localize(
-            zone, ambiguous="NaT", nonexistent="shift_forward"
-        )
-    else:
-        local_series = local_series.dt.tz_convert(zone)
+        sanitized_reset["s_time_local"], errors="coerce", utc=True
+    ).dt.tz_convert(zone)
     sanitized_reset["s_time_local"] = local_series
     sanitized_reset["s_time_utc"] = local_series.dt.tz_convert("UTC")
 
@@ -525,7 +551,11 @@ def sanitize_for_arrow(
     )
 
     for column in sanitized_reset.select_dtypes(include="object").columns:
-        converted = pd.to_numeric(sanitized_reset[column], errors="ignore")
+        try:
+            converted = pd.to_numeric(sanitized_reset[column])
+        except (TypeError, ValueError):
+            sanitized_reset[column] = sanitized_reset[column].astype("string")
+            continue
         sanitized_reset[column] = converted
         if sanitized_reset[column].dtype == "object":
             sanitized_reset[column] = sanitized_reset[column].astype("string")
@@ -595,9 +625,15 @@ def _metric_series_cached(
     return _metric_series(df, metric_key, tz_name, rule, agg)
 
 
-def main() -> None:
-    setup_streamlit_logging(STREAMLIT_LOG_PATH)
+def _run_dashboard() -> None:
     st.set_page_config(page_title="HomeSky", layout="wide")
+    if RERUN_SENTINEL_KEY not in st.session_state:
+        st.session_state[RERUN_SENTINEL_KEY] = False
+    elif st.session_state[RERUN_SENTINEL_KEY]:
+        st.session_state[RERUN_SENTINEL_KEY] = False
+
+    if "initialized" not in st.session_state:
+        st.session_state["initialized"] = True
     try:
         config = ingest.load_config()
     except FileNotFoundError as exc:
@@ -685,7 +721,8 @@ def main() -> None:
                     feather_file.unlink()
                 except OSError:  # pragma: no cover - best effort cleanup
                     pass
-        st.experimental_rerun()
+        _trigger_streamlit_rerun()
+        return
 
     metric_options = _available_metrics(df)
     if not metric_options:
@@ -1057,6 +1094,29 @@ def main() -> None:
         file_name="homesky.parquet",
         mime="application/octet-stream",
     )
+
+
+def main() -> None:
+    setup_streamlit_logging(str(STREAMLIT_LOG_PATH))
+    try:
+        _run_dashboard()
+    except AttributeError as exc:
+        if "experimental_rerun" in str(exc):
+            log.warning("Streamlit rerun API changed; retrying with st.rerun()")
+            try:
+                st.rerun()
+            except Exception as rerun_exc:  # pragma: no cover - defensive guard
+                log.error("st.rerun() failed: %s", rerun_exc)
+                _record_streamlit_error(rerun_exc)
+                raise
+            return
+        log.exception("Streamlit AttributeError: %s", exc)
+        _record_streamlit_error(exc)
+        raise
+    except Exception as exc:  # pragma: no cover - surfaced to UI
+        log.exception("Unhandled exception in Streamlit main: %s", exc)
+        _record_streamlit_error(exc)
+        raise
 
 
 if __name__ == "__main__":
