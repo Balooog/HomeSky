@@ -7,6 +7,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from loguru import logger
@@ -285,10 +286,28 @@ def load_dataset(
 
     cfg = config or {}
     storage = cfg.get("storage", {})
+    tz_cfg = cfg.get("timezone", {})
+    local_tz = str(tz_cfg.get("local_tz") or "UTC")
     sqlite_resolved = Path(sqlite_path or storage.get("sqlite_path", "./data/homesky.sqlite"))
     parquet_resolved = Path(parquet_path or storage.get("parquet_path", "./data/homesky.parquet"))
     db = DatabaseManager(sqlite_resolved, parquet_resolved)
-    return db.read_dataframe(limit=limit)
+    df = db.read_dataframe(limit=limit, local_tz=local_tz)
+    if df.empty:
+        return df
+    if "s_time_local" in df.columns and "s_time_local" in df.index.names:
+        df = df.reset_index(drop=True)
+    if "s_time_local" not in df.columns:
+        df = df.reset_index(drop=False)
+        if "s_time_local" not in df.columns and "epoch_ms" in df.columns:
+            timestamps = pd.to_datetime(df["epoch_ms"], unit="ms", errors="coerce", utc=True)
+            try:
+                zone = ZoneInfo(local_tz)
+            except Exception:  # pragma: no cover - fallback to UTC
+                zone = ZoneInfo("UTC")
+            df["s_time_local"] = timestamps.dt.tz_convert(zone)
+    df = df.drop_duplicates(subset=["s_time_local", "mac"], keep="last")
+    df = df.sort_values("s_time_local").set_index("s_time_local")
+    return df
 
 
 def flatten_observations(records: List[Dict]) -> pd.DataFrame:
