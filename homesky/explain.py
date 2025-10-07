@@ -9,8 +9,8 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
-import ingest
-from utils.db import DatabaseManager
+from homesky import ingest
+from homesky.utils.db import DatabaseManager
 
 console = Console()
 

@@ -9,9 +9,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+# Allow both "python -m homesky.gui" and direct file execution.
 import PySimpleGUI as sg
 
-import ingest
+__HS_BOOTSTRAPPED__ = False
+try:
+    from . import ingest  # type: ignore[no-redef]
+except Exception:  # pragma: no cover - fallback for direct runs
+    import sys as _sys
+    import pathlib as _pathlib
+
+    _root = _pathlib.Path(__file__).resolve().parents[1]
+    if str(_root) not in _sys.path:
+        _sys.path.insert(0, str(_root))
+    __HS_BOOTSTRAPPED__ = True
+    from homesky import ingest  # type: ignore[no-redef]
 from backfill import backfill_range
 from import_offline import (
     TimestampDetectionError,
