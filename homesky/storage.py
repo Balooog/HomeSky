@@ -9,8 +9,8 @@ from typing import List, Optional, Sequence
 import pandas as pd
 from loguru import logger
 
-from utils.db import DatabaseManager
-from utils.derived import compute_all_derived
+from homesky.utils.db import DatabaseManager
+from homesky.utils.derived import compute_all_derived
 
 
 EXCLUDED_KEYS: frozenset[str] = frozenset({

@@ -12,11 +12,10 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from homesky.utils.config import get_station_tz
 from homesky.utils.logging_setup import get_logger
 
 log = get_logger("db")
-
-STATION_TZ = "America/New_York"  # TODO: make configurable via config
 
 
 def _json_default(value: object) -> Optional[object]:
@@ -79,6 +78,7 @@ def parse_obs_times(df: pd.DataFrame) -> pd.DataFrame:
     if "obs_time_local" not in df.columns:
         return df
 
+    zone = get_station_tz()
     working = df.copy()
     try:
         ts = pd.to_datetime(working["obs_time_local"], errors="coerce", utc=False)
@@ -86,12 +86,12 @@ def parse_obs_times(df: pd.DataFrame) -> pd.DataFrame:
         tz_attr = getattr(ts.dt, "tz", None)
         if tz_attr is None:
             ts = ts.dt.tz_localize(
-                STATION_TZ,
+                zone,
                 nonexistent="shift_forward",
                 ambiguous="NaT",
             )
         else:
-            ts = ts.dt.tz_convert(STATION_TZ)
+            ts = ts.dt.tz_convert(zone)
 
         working["obs_time_local"] = ts
         working = working.drop_duplicates(subset=["obs_time_local"])

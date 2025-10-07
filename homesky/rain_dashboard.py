@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 from zoneinfo import ZoneInfo
 
-from utils.theming import Theme
+from homesky.utils.theming import Theme
 
 
 RAIN_INTENSITY_BINS: Sequence[float] = (

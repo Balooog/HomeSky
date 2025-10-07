@@ -17,12 +17,13 @@ from pandas.api import types as ptypes
 import streamlit as st
 import traceback
 
-import ingest
-from rain_dashboard import compute_rainfall, render_rain_dashboard
-from utils.derived import compute_all_derived
-from utils.logging import setup_streamlit_logging
-from utils.logging_setup import get_logger
-from utils.theming import Theme, get_theme, load_typography
+from homesky import ingest
+from homesky.rain_dashboard import compute_rainfall, render_rain_dashboard
+from homesky.utils.config import get_station_tz
+from homesky.utils.derived import compute_all_derived
+from homesky.utils.logging import setup_streamlit_logging
+from homesky.utils.logging_setup import get_logger
+from homesky.utils.theming import Theme, get_theme, load_typography
 
 
 MetricEntry = Tuple[str, Tuple[str, ...]]
@@ -103,9 +104,14 @@ def ensure_time_index(df: pd.DataFrame, tz_name: str) -> pd.DataFrame:
         utc_source = pd.to_datetime(epoch_series, unit="ms", errors="coerce", utc=True)
     elif "s_time_local" in working.columns:
         local_series = pd.to_datetime(
-            working["s_time_local"], errors="coerce", utc=True
+            working["s_time_local"], errors="coerce", utc=False
         )
-        localized = local_series.dt.tz_convert(zone)
+        if getattr(local_series.dt, "tz", None) is None:
+            localized = local_series.dt.tz_localize(
+                zone, ambiguous="NaT", nonexistent="shift_forward"
+            )
+        else:
+            localized = local_series.dt.tz_convert(zone)
         utc_source = localized.dt.tz_convert("UTC")
     elif isinstance(working.index, pd.DatetimeIndex):
         index_values = pd.Series(working.index, index=working.index)
@@ -680,7 +686,7 @@ def _run_dashboard() -> None:
 
     df = compute_all_derived(df, config)
 
-    tz_name = str(config.get("timezone", {}).get("local_tz") or "UTC")
+    tz_name = get_station_tz(default="UTC")
     df = _prepare_time_columns(df, tz_name)
     df_time = ensure_time_index(df, tz_name)
 

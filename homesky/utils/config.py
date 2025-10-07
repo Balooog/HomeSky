@@ -5,11 +5,14 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Iterable, List
+import tomllib
+from typing import Any, Iterable, List, Mapping
 
 ENVIRONMENT_VARIABLE = "HOMESKY_CONFIG"
 APP_DIR_NAME = "HomeSky"
 CONFIG_FILENAME = "config.toml"
+
+_CONFIG_CACHE: dict[str, Any] | None = None
 
 
 def _unique_paths(paths: Iterable[Path]) -> List[Path]:
@@ -87,3 +90,47 @@ def ensure_parent_directory(path: Path) -> None:
     """Create the parent directory for *path* if it does not already exist."""
 
     path.expanduser().parent.mkdir(parents=True, exist_ok=True)
+
+
+def get_config() -> Mapping[str, Any]:
+    """Load the active HomeSky configuration, caching the parsed mapping."""
+
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE is not None:
+        return _CONFIG_CACHE
+
+    data: dict[str, Any] = {}
+    for candidate in candidate_config_paths():
+        try:
+            if not candidate.exists():
+                continue
+            data = tomllib.loads(candidate.read_text(encoding="utf-8"))
+            break
+        except OSError:
+            continue
+        except tomllib.TOMLDecodeError:
+            continue
+
+    _CONFIG_CACHE = data
+    return data
+
+
+def get_station_tz(default: str = "America/New_York") -> str:
+    """Return the configured station timezone, falling back to *default*."""
+
+    config = get_config()
+    station_section = config.get("station") if isinstance(config, Mapping) else None
+    if isinstance(station_section, Mapping):
+        tz_value = station_section.get("timezone")
+        if tz_value:
+            return str(tz_value)
+
+    timezone_section = (
+        config.get("timezone") if isinstance(config, Mapping) else None
+    )
+    if isinstance(timezone_section, Mapping):
+        tz_value = timezone_section.get("local_tz")
+        if tz_value:
+            return str(tz_value)
+
+    return default
