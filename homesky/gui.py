@@ -5,21 +5,35 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+# Allow both "python -m homesky.gui" and direct file execution.
 import PySimpleGUI as sg
 
-import ingest
-from backfill import backfill_range
-from import_offline import (
+__HS_BOOTSTRAPPED__ = False
+try:
+    from . import ingest  # type: ignore[no-redef]
+except Exception:  # pragma: no cover - fallback for direct runs
+    import sys as _sys
+    import pathlib as _pathlib
+
+    _root = _pathlib.Path(__file__).resolve().parents[1]
+    if str(_root) not in _sys.path:
+        _sys.path.insert(0, str(_root))
+    __HS_BOOTSTRAPPED__ = True
+    from homesky import ingest  # type: ignore[no-redef]
+from homesky.backfill import backfill_range
+from homesky.import_offline import (
     TimestampDetectionError,
     TimestampOverride,
     import_files,
     save_timestamp_mapping,
 )
-from storage import StorageResult
+from homesky.storage import StorageResult
+from homesky.utils.logging_setup import get_logger
 
 try:
     import tomllib  # Python 3.11+
@@ -28,6 +42,33 @@ except ImportError:  # pragma: no cover
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 STREAMLIT_ENTRY = PACKAGE_DIR / "visualize_streamlit.py"
+
+
+def _warn_on_bare_imports() -> None:
+    suspicious: list[str] = []
+    for name, mod in list(sys.modules.items()):
+        if isinstance(mod, types.ModuleType) and name in {
+            "backfill",
+            "ingest",
+            "import_offline",
+            "visualize_streamlit",
+            "utils",
+            "ambient",
+            "db",
+        }:
+            suspicious.append(name)
+    if suspicious:
+        try:
+            log = get_logger("streamlit")
+            log.warning(
+                "Detected bare intra-package imports: %s. Use 'from homesky.<module> import …'",
+                suspicious,
+            )
+        except Exception:  # pragma: no cover - logging best effort
+            pass
+
+
+_warn_on_bare_imports()
 
 
 def bootstrap_config_file() -> Path:

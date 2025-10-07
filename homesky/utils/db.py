@@ -11,7 +11,11 @@ from typing import Dict, Iterable, List, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from loguru import logger
+
+from homesky.utils.config import get_station_tz
+from homesky.utils.logging_setup import get_logger
+
+log = get_logger("db")
 
 
 def _json_default(value: object) -> Optional[object]:
@@ -66,6 +70,34 @@ CREATE TABLE IF NOT EXISTS observations (
     UNIQUE(mac, obs_time_utc)
 );
 """
+
+
+def parse_obs_times(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize observation timestamps and drop duplicate local readings."""
+
+    if "obs_time_local" not in df.columns:
+        return df
+
+    zone = get_station_tz()
+    working = df.copy()
+    try:
+        ts = pd.to_datetime(working["obs_time_local"], errors="coerce", utc=False)
+
+        tz_attr = getattr(ts.dt, "tz", None)
+        if tz_attr is None:
+            ts = ts.dt.tz_localize(
+                zone,
+                nonexistent="shift_forward",
+                ambiguous="NaT",
+            )
+        else:
+            ts = ts.dt.tz_convert(zone)
+
+        working["obs_time_local"] = ts
+        working = working.drop_duplicates(subset=["obs_time_local"])
+    except Exception as exc:  # pragma: no cover - defensive logging only
+        log.exception("parse_obs_times failed: %s", exc)
+    return working
 
 
 @dataclass(slots=True)
@@ -148,9 +180,9 @@ class DatabaseManager:
                     )
                     inserted += cursor.rowcount
                 except sqlite3.DatabaseError as exc:  # pragma: no cover
-                    logger.exception("Failed to insert row: {}", exc)
+                    log.exception("Failed to insert row: %s", exc)
             conn.commit()
-        logger.debug("Inserted {} new rows into SQLite", inserted)
+        log.debug("Inserted %s new rows into SQLite", inserted)
         return inserted
 
     def fetch_last_timestamp(self, mac: Optional[str] = None) -> Optional[str]:
@@ -195,6 +227,7 @@ class DatabaseManager:
             df = pd.read_sql_query(query, conn, params=params)
         if df.empty:
             return df
+        df = parse_obs_times(df)
         expanded = pd.json_normalize(df["data"].apply(json.loads))
         epoch_ms_series = pd.to_numeric(df["epoch_ms"], errors="coerce")
         observed_at = pd.to_datetime(epoch_ms_series, unit="ms", errors="coerce", utc=True)
@@ -288,7 +321,7 @@ class DatabaseManager:
             combined.to_parquet(self.parquet_path, **write_kwargs)
         else:
             df_to_write.to_parquet(self.parquet_path, **write_kwargs)
-        logger.debug("Appended {} rows to Parquet lake", len(df_to_write))
+        log.debug("Appended %s rows to Parquet lake", len(df_to_write))
 
 
 def ensure_schema(sqlite_path: Path | str) -> None:
