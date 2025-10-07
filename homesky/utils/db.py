@@ -81,19 +81,24 @@ def parse_obs_times(df: pd.DataFrame) -> pd.DataFrame:
     zone = get_station_tz()
     working = df.copy()
     try:
-        ts = pd.to_datetime(working["obs_time_local"], errors="coerce", utc=False)
+        raw = working["obs_time_local"]
+        as_str = raw.astype("string")
+        offset_mask = as_str.str.contains(r"([Zz]|[+-]\d{2}:?\d{2})", na=False)
+        result = pd.Series(pd.NaT, index=working.index, dtype="datetime64[ns, UTC]")
 
-        tz_attr = getattr(ts.dt, "tz", None)
-        if tz_attr is None:
-            ts = ts.dt.tz_localize(
-                zone,
-                nonexistent="shift_forward",
-                ambiguous="NaT",
+        if offset_mask.any():
+            aware = pd.to_datetime(as_str[offset_mask], errors="coerce", utc=True)
+            result.loc[offset_mask] = aware
+
+        if (~offset_mask).any():
+            naive = pd.to_datetime(as_str[~offset_mask], errors="coerce", utc=False)
+            localized = naive.dt.tz_localize(
+                zone, nonexistent="shift_forward", ambiguous="NaT"
             )
-        else:
-            ts = ts.dt.tz_convert(zone)
+            result.loc[~offset_mask] = localized.dt.tz_convert("UTC")
 
-        working["obs_time_local"] = ts
+        local_series = result.dt.tz_convert(zone)
+        working["obs_time_local"] = local_series
         working = working.drop_duplicates(subset=["obs_time_local"])
     except Exception as exc:  # pragma: no cover - defensive logging only
         log.exception("parse_obs_times failed: %s", exc)

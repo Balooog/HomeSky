@@ -272,6 +272,17 @@ def _safe_localize_day(value: pd.Timestamp | str, zone: ZoneInfo) -> pd.Timestam
     return localized
 
 
+def _default_window_last_10_days(tz_name: str) -> Tuple[date, date]:
+    try:
+        zone = ZoneInfo(tz_name)
+    except Exception:
+        zone = ZoneInfo("UTC")
+    now = datetime.datetime.now(zone)
+    start = (now - timedelta(days=10)).date()
+    end = now.date()
+    return start, end
+
+
 def _format_timestamp(ts: Optional[pd.Timestamp], tz_name: str) -> str:
     if ts is None or pd.isna(ts):
         return "n/a"
@@ -491,35 +502,60 @@ def _metric_visual_style(metric_column: str, theme: Theme) -> Tuple[str, Optiona
 
 
 def _infer_tz_abbreviation(index: pd.DatetimeIndex, zone: ZoneInfo) -> str:
-    if index.empty:
-        candidate = pd.Timestamp.now(tz=zone)
-        return candidate.tzname() or getattr(zone, "key", str(zone))
-    size = len(index)
-    positions = []
-    for frac in (0.5, 0.0, 1.0):
-        if frac >= 1.0:
-            pos = size - 1
-        else:
-            pos = int(size * frac)
-        pos = max(0, min(pos, size - 1))
-        positions.append(pos)
-    sample_points = [index[pos] for pos in positions]
-    for point in sample_points:
+    """Return a friendly timezone abbreviation for *index* clamping lookups safely."""
+
+    def _fallback() -> str:
+        zone_name = str(zone)
+        return zone_name.split("/")[-1] if "/" in zone_name else zone_name
+
+    def _normalize_abbr(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        return "ET" if value in {"EDT", "EST"} else value
+
+    def _tzname_for(timestamp: pd.Timestamp) -> Optional[str]:
+        if pd.isna(timestamp):
+            return None
+        tzinfo = getattr(timestamp, "tz", None) or getattr(timestamp, "tzinfo", None)
         try:
-            if point.tzinfo is None:
-                localized = point.tz_localize(zone, ambiguous="NaT", nonexistent="shift_forward")
-            else:
-                localized = point.tz_convert(zone)
+            if tzinfo is not None:
+                name = tzinfo.tzname(timestamp)
+                if name:
+                    return name
+            localized = timestamp.tz_localize(
+                zone, ambiguous="NaT", nonexistent="shift_forward"
+            )
         except Exception:
-            continue
-        abbr = localized.tzname()
-        if abbr:
-            return "ET" if abbr in {"EDT", "EST"} else abbr
-    fallback = pd.Timestamp.now(tz=zone)
-    abbr = fallback.tzname()
-    if abbr:
-        return "ET" if abbr in {"EDT", "EST"} else abbr
-    return getattr(zone, "key", str(zone))
+            try:
+                localized = timestamp.tz_convert(zone)
+            except Exception:
+                return None
+        if pd.isna(localized):
+            return None
+        return localized.tzname()
+
+    try:
+        size = len(index)
+        if size == 0:
+            now = pd.Timestamp.now(tz=zone)
+            return _normalize_abbr(now.tzname()) or _fallback()
+        if size == 1:
+            name = _tzname_for(index[0])
+            return _normalize_abbr(name) or _fallback()
+
+        samples: List[pd.Timestamp] = []
+        for frac in (0.0, 0.5, 1.0):
+            pos = int((size - 1) * frac)
+            pos = max(0, min(size - 1, pos))
+            samples.append(index[pos])
+        for ts in samples:
+            name = _tzname_for(ts)
+            normalized = _normalize_abbr(name)
+            if normalized:
+                return normalized
+    except Exception:
+        pass
+    return _fallback()
 
 
 def sanitize_for_arrow(
@@ -721,26 +757,59 @@ def _run_dashboard() -> None:
     sqlite_path = storage_cfg.get("sqlite_path", "./data/homesky.sqlite")
     parquet_path = storage_cfg.get("parquet_path", "./data/homesky.parquet")
     token = _cache_token(sqlite_path, parquet_path)
-    try:
-        df = load_data(sqlite_path, parquet_path, token)
-    except Exception as exc:  # pragma: no cover - surfaced via Streamlit UI
-        st.error("Unable to load stored observations.")
-        st.exception(exc)
-        st.stop()
-
-    if df.empty:
-        st.info("No observations stored yet. Run ingest.py to begin capturing data.")
-        st.stop()
-
-    df = compute_all_derived(df, config)
-
     tz_name = get_station_tz(default="UTC")
-    df = _prepare_time_columns(df, tz_name)
-    df_time = ensure_time_index(df, tz_name)
 
-    if df_time.empty:
-        st.info("No observations available to display yet.")
-        st.stop()
+    df_time: pd.DataFrame = pd.DataFrame()
+    with st.status("Loading data…", expanded=False) as status:
+        progress = st.progress(0)
+        status.update(label="Reading stored observations…")
+        try:
+            df = load_data(sqlite_path, parquet_path, token)
+        except Exception as exc:  # pragma: no cover - surfaced via Streamlit UI
+            progress.progress(100)
+            status.update(label="Unable to load stored observations", state="error")
+            st.error("Unable to load stored observations.")
+            st.exception(exc)
+            st.stop()
+
+        progress.progress(30)
+        if df.empty:
+            status.update(label="No observations stored yet", state="error")
+            progress.progress(100)
+            st.info("No observations stored yet. Run ingest.py to begin capturing data.")
+            st.stop()
+
+        status.update(label="Computing derived metrics…")
+        try:
+            df = compute_all_derived(df, config)
+        except Exception as exc:  # pragma: no cover - surfaced via Streamlit UI
+            progress.progress(100)
+            status.update(label="Unable to compute derived metrics", state="error")
+            st.error("Unable to compute derived metrics.")
+            st.exception(exc)
+            st.stop()
+
+        progress.progress(60)
+        status.update(label="Normalizing timestamps…")
+        try:
+            df = _prepare_time_columns(df, tz_name)
+        except Exception as exc:  # pragma: no cover - surfaced via Streamlit UI
+            progress.progress(100)
+            status.update(label="Unable to normalize timestamps", state="error")
+            st.error("Unable to normalize timestamps.")
+            st.exception(exc)
+            st.stop()
+
+        progress.progress(85)
+        df_time = ensure_time_index(df, tz_name)
+        if df_time.empty:
+            status.update(label="No observations available", state="error")
+            progress.progress(100)
+            st.info("No observations available to display yet.")
+            st.stop()
+
+        progress.progress(100)
+        status.update(label="Data ready", state="complete")
 
     latest_ts = df_time.index.max() if not df_time.empty else None
 
@@ -1017,26 +1086,51 @@ def _run_dashboard() -> None:
 
     min_ts = df_time.index.min()
     max_ts = df_time.index.max()
-    default_end = max_ts
-    default_start = max(default_end - timedelta(days=30), min_ts)
+    min_date = min_ts.date()
+    max_date = max_ts.date()
+    hint_start, hint_end = _default_window_last_10_days(tz_name)
+    default_start_date = max(hint_start, min_date)
+    default_end_date = min(hint_end, max_date)
+    if default_start_date > default_end_date:
+        default_start_date, default_end_date = min_date, max_date
+
     date_state_key = "homesky_date_range"
-    default_dates = get_date_range(default_start, default_end, date_state_key)
-    date_range = st.sidebar.date_input(
-        "Date range",
-        value=default_dates,
-        min_value=min_ts.date(),
-        max_value=max_ts.date(),
-        key=date_state_key,
+    default_dates = get_date_range(
+        pd.Timestamp(default_start_date), pd.Timestamp(default_end_date), date_state_key
     )
 
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        start_date, end_date = date_range
-    else:
-        start_date = date_range
-        end_date = date_range
-    start_date = _as_date(start_date, default_dates[0])
-    end_date = _as_date(end_date, default_dates[1])
+    from_key = "homesky_date_from"
+    to_key = "homesky_date_to"
+    st.session_state.setdefault(from_key, default_dates[0])
+    st.session_state.setdefault(to_key, default_dates[1])
+
+    st.caption("Select date range")
+    col_from, col_to = st.columns(2)
+    with col_from:
+        date_from = st.date_input(
+            "From",
+            value=st.session_state[from_key],
+            min_value=min_date,
+            max_value=max_date,
+            key=from_key,
+        )
+    with col_to:
+        date_to = st.date_input(
+            "To",
+            value=st.session_state[to_key],
+            min_value=min_date,
+            max_value=max_date,
+            key=to_key,
+        )
+
+    start_date = _as_date(date_from, default_dates[0])
+    end_date = _as_date(date_to, default_dates[1])
     start_date, end_date = _normalize_date_pair(start_date, end_date)
+    if start_date != date_from:
+        st.session_state[from_key] = start_date
+    if end_date != date_to:
+        st.session_state[to_key] = end_date
+    st.session_state[date_state_key] = (start_date, end_date)
     normalized_key = "_homesky_date_range_selected"
     st.session_state[normalized_key] = (start_date, end_date)
 
