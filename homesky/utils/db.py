@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
+from pandas.api.types import is_datetime64_any_dtype as _is_dt
 
 from homesky.utils.config import get_station_tz
 from homesky.utils.logging_setup import get_logger
@@ -73,8 +75,6 @@ CREATE TABLE IF NOT EXISTS observations (
 
 
 def parse_obs_times(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize observation timestamps and drop duplicate local readings."""
-
     if "obs_time_local" not in df.columns:
         return df
 
@@ -82,26 +82,34 @@ def parse_obs_times(df: pd.DataFrame) -> pd.DataFrame:
     working = df.copy()
     try:
         raw = working["obs_time_local"]
+        if isinstance(raw, pd.Index):
+            raw = raw.to_series(index=working.index)
+
+        parsed = pd.to_datetime(raw, errors="coerce", utc=False)
+        if not _is_dt(parsed):
+            log.warning("parse_obs_times: non-datetime column; leaving unchanged")
+            return working
+
         as_str = raw.astype("string")
-        offset_mask = as_str.str.contains(r"([Zz]|[+-]\d{2}:?\d{2})", na=False)
+        has_offset = as_str.str.contains(r"([Zz]|[+-]\d{2}:?\d{2})", na=False)
+
         result = pd.Series(pd.NaT, index=working.index, dtype="datetime64[ns, UTC]")
 
-        if offset_mask.any():
-            aware = pd.to_datetime(as_str[offset_mask], errors="coerce", utc=True)
-            result.loc[offset_mask] = aware
+        if has_offset.any():
+            aware = pd.to_datetime(as_str[has_offset], errors="coerce", utc=True)
+            result.loc[has_offset] = aware
 
-        if (~offset_mask).any():
-            naive = pd.to_datetime(as_str[~offset_mask], errors="coerce", utc=False)
-            localized = naive.dt.tz_localize(
+        if (~has_offset).any():
+            naive = pd.to_datetime(as_str[~has_offset], errors="coerce", utc=False)
+            naive = naive.dt.tz_localize(
                 zone, nonexistent="shift_forward", ambiguous="NaT"
             )
-            result.loc[~offset_mask] = localized.dt.tz_convert("UTC")
+            result.loc[~has_offset] = naive.tz_convert("UTC")
 
-        local_series = result.dt.tz_convert(zone)
-        working["obs_time_local"] = local_series
+        working["obs_time_local"] = result.dt.tz_convert(zone)
         working = working.drop_duplicates(subset=["obs_time_local"])
-    except Exception as exc:  # pragma: no cover - defensive logging only
-        log.exception("parse_obs_times failed: %s", exc)
+    except Exception as e:  # pragma: no cover - defensive logging only
+        log.exception(f"parse_obs_times failed: {e}")
     return working
 
 
@@ -294,7 +302,6 @@ class DatabaseManager:
             expanded.insert(3, "s_time_local", obs_time_local)
         else:
             expanded["s_time_local"] = obs_time_local
-        expanded["epoch_ms"] = expanded["epoch_ms"].astype("int64")
         expanded.index = observed_at
         expanded.index.name = "s_time_utc"
 
@@ -334,6 +341,20 @@ class DatabaseManager:
                 expanded["s_time_local"] = timestamps.dt.tz_convert(zone)
         expanded = expanded.drop_duplicates(subset=["s_time_local", "mac"], keep="last")
         expanded = expanded.sort_values("s_time_local").set_index("s_time_local")
+
+        if "epoch_ms" in expanded.columns:
+            before_na = expanded["epoch_ms"].isna().sum()
+            expanded["epoch_ms"] = pd.to_numeric(expanded["epoch_ms"], errors="coerce")
+            expanded["epoch_ms"] = expanded["epoch_ms"].replace([np.inf, -np.inf], np.nan)
+            after_na = expanded["epoch_ms"].isna().sum()
+            cleaned = int(after_na)
+            if cleaned or before_na:
+                log.info(
+                    "read_dataframe: epoch_ms cleaned (before_na=%s, remaining_na=%s)",
+                    int(before_na),
+                    cleaned,
+                )
+            expanded["epoch_ms"] = expanded["epoch_ms"].fillna(0).astype("int64")
         return expanded
 
     # -- Parquet helpers ------------------------------------------------

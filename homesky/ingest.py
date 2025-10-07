@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -362,6 +363,18 @@ def sync_new(
     since_value = None
     if since_ts is not None and not pd.isna(since_ts):
         since_value = since_ts.to_pydatetime()
+        now_utc = datetime.now(timezone.utc)
+        since_ts_utc = since_ts.tz_convert("UTC")
+        delta = now_utc - since_ts_utc.to_pydatetime()
+        if delta < timedelta(minutes=10):
+            log.info("sync_new: DB fresh (<10 min); skipping remote fetch")
+            return {
+                "added": 0,
+                "since": since_value,
+                "until": since_value,
+                "skipped": 0,
+                "skipped_reason": "fresh",
+            }
 
     client = client or AmbientClient(
         api_key=ambient_cfg.get("api_key"),
@@ -373,13 +386,25 @@ def sync_new(
     records = client.get_device_data(mac=mac, limit=limit)
     if not records:
         log.info("sync_new: Ambient API returned no records to process")
-        return {"added": 0, "since": since_value, "until": since_value, "skipped": 0}
+        return {
+            "added": 0,
+            "since": since_value,
+            "until": since_value,
+            "skipped": 0,
+            "skipped_reason": None,
+        }
 
     raw_count = len(records)
     frame = _history_records_to_frame(records, mac)
     if frame.empty:
         log.info("sync_new: fetched payload contained no valid observations")
-        return {"added": 0, "since": since_value, "until": since_value, "skipped": raw_count}
+        return {
+            "added": 0,
+            "since": since_value,
+            "until": since_value,
+            "skipped": raw_count,
+            "skipped_reason": "empty",
+        }
 
     if ingest_cfg.get("drop_implausible_values", True):
         frame = drop_implausible(frame)
@@ -389,7 +414,13 @@ def sync_new(
     )
     if canonical.empty:
         log.info("sync_new: no canonical rows available after preprocessing")
-        return {"added": 0, "since": since_value, "until": since_value, "skipped": raw_count}
+        return {
+            "added": 0,
+            "since": since_value,
+            "until": since_value,
+            "skipped": raw_count,
+            "skipped_reason": "empty",
+        }
 
     canonical = filter_new_canonical(
         canonical,
@@ -399,7 +430,13 @@ def sync_new(
     )
     if canonical.empty:
         log.info("sync_new: all fetched rows already present in the database")
-        return {"added": 0, "since": since_value, "until": since_value, "skipped": raw_count}
+        return {
+            "added": 0,
+            "since": since_value,
+            "until": since_value,
+            "skipped": raw_count,
+            "skipped_reason": "duplicate",
+        }
 
     result = storage_manager.upsert_canonical(canonical)
     added = int(result.inserted)
@@ -416,7 +453,13 @@ def sync_new(
     else:
         log.info("sync_new: no new rows persisted after storage layer checks")
 
-    return {"added": added, "since": since_value, "until": until_ts, "skipped": skipped}
+    return {
+        "added": added,
+        "since": since_value,
+        "until": until_ts,
+        "skipped": skipped,
+        "skipped_reason": None,
+    }
 
 
 def detect_cadence_seconds(df: pd.DataFrame) -> int:

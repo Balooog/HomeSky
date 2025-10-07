@@ -502,60 +502,36 @@ def _metric_visual_style(metric_column: str, theme: Theme) -> Tuple[str, Optiona
 
 
 def _infer_tz_abbreviation(index: pd.DatetimeIndex, zone: ZoneInfo) -> str:
-    """Return a friendly timezone abbreviation for *index* clamping lookups safely."""
+    """Clamp sampling to avoid IndexError and prefer native abbreviations."""
 
-    def _fallback() -> str:
-        zone_name = str(zone)
-        return zone_name.split("/")[-1] if "/" in zone_name else zone_name
-
-    def _normalize_abbr(value: Optional[str]) -> Optional[str]:
-        if not value:
-            return None
-        return "ET" if value in {"EDT", "EST"} else value
-
-    def _tzname_for(timestamp: pd.Timestamp) -> Optional[str]:
-        if pd.isna(timestamp):
-            return None
-        tzinfo = getattr(timestamp, "tz", None) or getattr(timestamp, "tzinfo", None)
-        try:
-            if tzinfo is not None:
-                name = tzinfo.tzname(timestamp)
-                if name:
-                    return name
-            localized = timestamp.tz_localize(
-                zone, ambiguous="NaT", nonexistent="shift_forward"
-            )
-        except Exception:
-            try:
-                localized = timestamp.tz_convert(zone)
-            except Exception:
-                return None
-        if pd.isna(localized):
-            return None
-        return localized.tzname()
+    zone_name = str(zone)
+    fallback = zone_name.split("/")[-1] if "/" in zone_name else zone_name
 
     try:
-        size = len(index)
-        if size == 0:
-            now = pd.Timestamp.now(tz=zone)
-            return _normalize_abbr(now.tzname()) or _fallback()
-        if size == 1:
-            name = _tzname_for(index[0])
-            return _normalize_abbr(name) or _fallback()
+        n = len(index)
+        if n == 0:
+            return fallback
+        if n == 1:
+            ts = index[0]
+            tz_attr = getattr(ts, "tz", None)
+            if tz_attr is not None:
+                name = tz_attr.tzname(ts)
+                if name:
+                    return name
+            return fallback
 
-        samples: List[pd.Timestamp] = []
+        picks: List[pd.Timestamp] = []
         for frac in (0.0, 0.5, 1.0):
-            pos = int((size - 1) * frac)
-            pos = max(0, min(size - 1, pos))
-            samples.append(index[pos])
-        for ts in samples:
-            name = _tzname_for(ts)
-            normalized = _normalize_abbr(name)
-            if normalized:
-                return normalized
+            pos = max(0, min(n - 1, int((n - 1) * frac)))
+            picks.append(index[pos])
+        for ts in picks:
+            tz_attr = getattr(ts, "tz", None)
+            name = tz_attr.tzname(ts) if tz_attr is not None else None
+            if name:
+                return name
     except Exception:
         pass
-    return _fallback()
+    return fallback
 
 
 def sanitize_for_arrow(
