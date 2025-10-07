@@ -207,6 +207,33 @@ class DatabaseManager:
             row = conn.execute(query, params).fetchone()
         return int(row[0]) if row and row[0] is not None else None
 
+    def max_observation_time(self, mac: Optional[str] = None) -> Optional[pd.Timestamp]:
+        """Return the most recent observation timestamp stored in SQLite."""
+
+        query = "SELECT MAX(COALESCE(obs_time_utc, obs_time_local)) FROM observations"
+        params: tuple = ()
+        if mac:
+            query += " WHERE mac = ?"
+            params = (mac,)
+        with self._connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        if not row:
+            return None
+        value = row[0]
+        if value is None:
+            return None
+        ts = pd.to_datetime(value, errors="coerce")
+        if isinstance(ts, pd.Series):
+            ts = ts.iloc[0]
+        if pd.isna(ts):
+            return None
+        tz_attr = getattr(ts, "tzinfo", None)
+        if tz_attr is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return ts
+
     def read_dataframe(
         self,
         mac: Optional[str] = None,
