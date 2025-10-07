@@ -494,7 +494,16 @@ def _infer_tz_abbreviation(index: pd.DatetimeIndex, zone: ZoneInfo) -> str:
     if index.empty:
         candidate = pd.Timestamp.now(tz=zone)
         return candidate.tzname() or getattr(zone, "key", str(zone))
-    sample_points = [index[int(len(index) * frac)] for frac in (0.5, 0.0, 1.0)]
+    size = len(index)
+    positions = []
+    for frac in (0.5, 0.0, 1.0):
+        if frac >= 1.0:
+            pos = size - 1
+        else:
+            pos = int(size * frac)
+        pos = max(0, min(pos, size - 1))
+        positions.append(pos)
+    sample_points = [index[pos] for pos in positions]
     for point in sample_points:
         try:
             if point.tzinfo is None:
