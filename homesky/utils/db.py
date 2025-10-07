@@ -81,19 +81,24 @@ def parse_obs_times(df: pd.DataFrame) -> pd.DataFrame:
     zone = get_station_tz()
     working = df.copy()
     try:
-        ts = pd.to_datetime(working["obs_time_local"], errors="coerce", utc=False)
+        raw = working["obs_time_local"]
+        as_str = raw.astype("string")
+        offset_mask = as_str.str.contains(r"([Zz]|[+-]\d{2}:?\d{2})", na=False)
+        result = pd.Series(pd.NaT, index=working.index, dtype="datetime64[ns, UTC]")
 
-        tz_attr = getattr(ts.dt, "tz", None)
-        if tz_attr is None:
-            ts = ts.dt.tz_localize(
-                zone,
-                nonexistent="shift_forward",
-                ambiguous="NaT",
+        if offset_mask.any():
+            aware = pd.to_datetime(as_str[offset_mask], errors="coerce", utc=True)
+            result.loc[offset_mask] = aware
+
+        if (~offset_mask).any():
+            naive = pd.to_datetime(as_str[~offset_mask], errors="coerce", utc=False)
+            localized = naive.dt.tz_localize(
+                zone, nonexistent="shift_forward", ambiguous="NaT"
             )
-        else:
-            ts = ts.dt.tz_convert(zone)
+            result.loc[~offset_mask] = localized.dt.tz_convert("UTC")
 
-        working["obs_time_local"] = ts
+        local_series = result.dt.tz_convert(zone)
+        working["obs_time_local"] = local_series
         working = working.drop_duplicates(subset=["obs_time_local"])
     except Exception as exc:  # pragma: no cover - defensive logging only
         log.exception("parse_obs_times failed: %s", exc)
@@ -206,6 +211,33 @@ class DatabaseManager:
         with self._connect() as conn:
             row = conn.execute(query, params).fetchone()
         return int(row[0]) if row and row[0] is not None else None
+
+    def max_observation_time(self, mac: Optional[str] = None) -> Optional[pd.Timestamp]:
+        """Return the most recent observation timestamp stored in SQLite."""
+
+        query = "SELECT MAX(COALESCE(obs_time_utc, obs_time_local)) FROM observations"
+        params: tuple = ()
+        if mac:
+            query += " WHERE mac = ?"
+            params = (mac,)
+        with self._connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        if not row:
+            return None
+        value = row[0]
+        if value is None:
+            return None
+        ts = pd.to_datetime(value, errors="coerce")
+        if isinstance(ts, pd.Series):
+            ts = ts.iloc[0]
+        if pd.isna(ts):
+            return None
+        tz_attr = getattr(ts, "tzinfo", None)
+        if tz_attr is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return ts
 
     def read_dataframe(
         self,
