@@ -17,12 +17,28 @@ from pandas.api import types as ptypes
 import streamlit as st
 import traceback
 
-from homesky import ingest
+try:  # Package-aware import shim for Streamlit's execution context
+    if __package__:
+        from . import ingest  # type: ignore
+        from .utils.db import parse_obs_times  # type: ignore
+        from .utils.logging_setup import get_logger  # type: ignore
+    else:  # pragma: no cover - Streamlit sets __package__ to None
+        raise ImportError
+except Exception:  # pragma: no cover - fallback for direct script execution
+    import pathlib
+    import sys
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from homesky import ingest  # type: ignore
+    from homesky.utils.db import parse_obs_times  # type: ignore
+    from homesky.utils.logging_setup import get_logger  # type: ignore
+
 from homesky.rain_dashboard import compute_rainfall, render_rain_dashboard
 from homesky.utils.config import get_station_tz
 from homesky.utils.derived import compute_all_derived
 from homesky.utils.logging import setup_streamlit_logging
-from homesky.utils.logging_setup import get_logger
 from homesky.utils.theming import Theme, get_theme, load_typography
 
 
@@ -256,6 +272,17 @@ def _safe_localize_day(value: pd.Timestamp | str, zone: ZoneInfo) -> pd.Timestam
     return localized
 
 
+def _default_window_last_10_days(tz_name: str) -> Tuple[date, date]:
+    try:
+        zone = ZoneInfo(tz_name)
+    except Exception:
+        zone = ZoneInfo("UTC")
+    now = datetime.datetime.now(zone)
+    start = (now - timedelta(days=10)).date()
+    end = now.date()
+    return start, end
+
+
 def _format_timestamp(ts: Optional[pd.Timestamp], tz_name: str) -> str:
     if ts is None or pd.isna(ts):
         return "n/a"
@@ -475,26 +502,36 @@ def _metric_visual_style(metric_column: str, theme: Theme) -> Tuple[str, Optiona
 
 
 def _infer_tz_abbreviation(index: pd.DatetimeIndex, zone: ZoneInfo) -> str:
-    if index.empty:
-        candidate = pd.Timestamp.now(tz=zone)
-        return candidate.tzname() or getattr(zone, "key", str(zone))
-    sample_points = [index[int(len(index) * frac)] for frac in (0.5, 0.0, 1.0)]
-    for point in sample_points:
-        try:
-            if point.tzinfo is None:
-                localized = point.tz_localize(zone, ambiguous="NaT", nonexistent="shift_forward")
-            else:
-                localized = point.tz_convert(zone)
-        except Exception:
-            continue
-        abbr = localized.tzname()
-        if abbr:
-            return "ET" if abbr in {"EDT", "EST"} else abbr
-    fallback = pd.Timestamp.now(tz=zone)
-    abbr = fallback.tzname()
-    if abbr:
-        return "ET" if abbr in {"EDT", "EST"} else abbr
-    return getattr(zone, "key", str(zone))
+    """Clamp sampling to avoid IndexError and prefer native abbreviations."""
+
+    zone_name = str(zone)
+    fallback = zone_name.split("/")[-1] if "/" in zone_name else zone_name
+
+    try:
+        n = len(index)
+        if n == 0:
+            return fallback
+        if n == 1:
+            ts = index[0]
+            tz_attr = getattr(ts, "tz", None)
+            if tz_attr is not None:
+                name = tz_attr.tzname(ts)
+                if name:
+                    return name
+            return fallback
+
+        picks: List[pd.Timestamp] = []
+        for frac in (0.0, 0.5, 1.0):
+            pos = max(0, min(n - 1, int((n - 1) * frac)))
+            picks.append(index[pos])
+        for ts in picks:
+            tz_attr = getattr(ts, "tz", None)
+            name = tz_attr.tzname(ts) if tz_attr is not None else None
+            if name:
+                return name
+    except Exception:
+        pass
+    return fallback
 
 
 def sanitize_for_arrow(
@@ -659,6 +696,29 @@ def _run_dashboard() -> None:
 
     _ensure_logging(config)
 
+    storage_manager = ingest.get_storage_manager(config)
+    ingest_cfg = config.get("ingest", {})
+    auto_sync_enabled = bool(ingest_cfg.get("auto_sync_on_launch", True))
+    auto_sync_done_key = "_homesky_auto_sync_done"
+    if auto_sync_enabled and not st.session_state.get(auto_sync_done_key, False):
+        with st.spinner("Checking for new observations…"):
+            try:
+                result = ingest.sync_new(config=config, storage=storage_manager)
+            except Exception as exc:  # pragma: no cover - surfaced to UI
+                st.session_state[auto_sync_done_key] = True
+                st.session_state["_homesky_auto_sync_error"] = str(exc)
+                log.warning("Auto-sync on launch failed: %s", exc)
+            else:
+                st.session_state[auto_sync_done_key] = True
+                st.session_state["_homesky_auto_sync_result"] = result
+                added = int(result.get("added", 0) or 0)
+                if added > 0:
+                    st.toast(f"Synced {added} new observations", icon="✅")
+                else:
+                    log.info("Auto-sync on launch: database already up-to-date")
+    elif not auto_sync_enabled:
+        st.session_state.setdefault(auto_sync_done_key, True)
+
     config_path = getattr(ingest.load_config, "last_path", None)
     if config_path is not None:
         st.caption(f"Config: {config_path}")
@@ -673,26 +733,59 @@ def _run_dashboard() -> None:
     sqlite_path = storage_cfg.get("sqlite_path", "./data/homesky.sqlite")
     parquet_path = storage_cfg.get("parquet_path", "./data/homesky.parquet")
     token = _cache_token(sqlite_path, parquet_path)
-    try:
-        df = load_data(sqlite_path, parquet_path, token)
-    except Exception as exc:  # pragma: no cover - surfaced via Streamlit UI
-        st.error("Unable to load stored observations.")
-        st.exception(exc)
-        st.stop()
-
-    if df.empty:
-        st.info("No observations stored yet. Run ingest.py to begin capturing data.")
-        st.stop()
-
-    df = compute_all_derived(df, config)
-
     tz_name = get_station_tz(default="UTC")
-    df = _prepare_time_columns(df, tz_name)
-    df_time = ensure_time_index(df, tz_name)
 
-    if df_time.empty:
-        st.info("No observations available to display yet.")
-        st.stop()
+    df_time: pd.DataFrame = pd.DataFrame()
+    with st.status("Loading data…", expanded=False) as status:
+        progress = st.progress(0)
+        status.update(label="Reading stored observations…")
+        try:
+            df = load_data(sqlite_path, parquet_path, token)
+        except Exception as exc:  # pragma: no cover - surfaced via Streamlit UI
+            progress.progress(100)
+            status.update(label="Unable to load stored observations", state="error")
+            st.error("Unable to load stored observations.")
+            st.exception(exc)
+            st.stop()
+
+        progress.progress(30)
+        if df.empty:
+            status.update(label="No observations stored yet", state="error")
+            progress.progress(100)
+            st.info("No observations stored yet. Run ingest.py to begin capturing data.")
+            st.stop()
+
+        status.update(label="Computing derived metrics…")
+        try:
+            df = compute_all_derived(df, config)
+        except Exception as exc:  # pragma: no cover - surfaced via Streamlit UI
+            progress.progress(100)
+            status.update(label="Unable to compute derived metrics", state="error")
+            st.error("Unable to compute derived metrics.")
+            st.exception(exc)
+            st.stop()
+
+        progress.progress(60)
+        status.update(label="Normalizing timestamps…")
+        try:
+            df = _prepare_time_columns(df, tz_name)
+        except Exception as exc:  # pragma: no cover - surfaced via Streamlit UI
+            progress.progress(100)
+            status.update(label="Unable to normalize timestamps", state="error")
+            st.error("Unable to normalize timestamps.")
+            st.exception(exc)
+            st.stop()
+
+        progress.progress(85)
+        df_time = ensure_time_index(df, tz_name)
+        if df_time.empty:
+            status.update(label="No observations available", state="error")
+            progress.progress(100)
+            st.info("No observations available to display yet.")
+            st.stop()
+
+        progress.progress(100)
+        status.update(label="Data ready", state="complete")
 
     latest_ts = df_time.index.max() if not df_time.empty else None
 
@@ -703,6 +796,39 @@ def _run_dashboard() -> None:
     )
 
     st.title("HomeSky Dashboard")
+
+    auto_sync_error = st.session_state.get("_homesky_auto_sync_error")
+    auto_sync_result = st.session_state.get("_homesky_auto_sync_result")
+    if auto_sync_error:
+        st.warning(f"Auto-sync failed: {auto_sync_error}")
+    elif auto_sync_result:
+        added = int(auto_sync_result.get("added", 0) or 0)
+        skipped = int(auto_sync_result.get("skipped", 0) or 0)
+        since_raw = auto_sync_result.get("since")
+        until_raw = auto_sync_result.get("until")
+        since_ts = (
+            pd.to_datetime(since_raw, utc=True, errors="coerce")
+            if since_raw
+            else None
+        )
+        until_ts = (
+            pd.to_datetime(until_raw, utc=True, errors="coerce")
+            if until_raw
+            else None
+        )
+        summary_parts: List[str] = []
+        if added > 0:
+            summary_parts.append(f"added {added:,} rows")
+        else:
+            summary_parts.append("database already up-to-date")
+        if skipped > 0:
+            summary_parts.append(f"skipped {skipped:,}")
+        if since_ts is not None and not pd.isna(since_ts):
+            summary_parts.append(f"since {_format_timestamp(since_ts, tz_name)}")
+        if until_ts is not None and not pd.isna(until_ts):
+            summary_parts.append(f"latest {_format_timestamp(until_ts, tz_name)}")
+        if summary_parts:
+            st.caption("Auto-sync: " + " • ".join(summary_parts))
 
     st.markdown(
         f"<div style='display:inline-block;padding:0.35rem 0.75rem;border-radius:999px;"
@@ -729,6 +855,113 @@ def _run_dashboard() -> None:
                     pass
         _trigger_streamlit_rerun()
         return
+
+    with st.sidebar.expander("Advanced ingestion", expanded=False):
+        st.caption(
+            "Backfill operations use the Ambient history API and may take several minutes."
+        )
+        show_backfill_controls = st.checkbox(
+            "Show backfill controls",
+            value=False,
+            key="homesky_show_backfill_controls",
+        )
+        if show_backfill_controls:
+            if st.button("Backfill last 24 hours", key="homesky_backfill_24h"):
+                with st.spinner("Backfilling last 24 hours…"):
+                    try:
+                        inserted = ingest.backfill(
+                            config,
+                            24,
+                            storage=storage_manager,
+                            tz=tz_name,
+                        )
+                    except Exception as exc:  # pragma: no cover - surfaced to UI
+                        st.error(f"Backfill failed: {exc}")
+                        log.warning("Backfill (24h) failed: %s", exc)
+                    else:
+                        if inserted:
+                            st.success(
+                                f"Inserted {inserted} rows from the last 24 hours."
+                            )
+                            st.toast(f"Backfill added {inserted} rows", icon="✅")
+                        else:
+                            st.info("No new observations found in the last 24 hours.")
+                        load_data.clear()
+                        _trigger_streamlit_rerun()
+
+        enable_custom_backfill = st.checkbox(
+            "Enable custom backfill",
+            value=False,
+            key="homesky_enable_custom_backfill",
+        )
+        if enable_custom_backfill:
+            default_start = date.today() - timedelta(days=7)
+            default_end = date.today()
+            custom_start = st.date_input(
+                "Start date",
+                value=default_start,
+                key="homesky_custom_backfill_start",
+            )
+            custom_end = st.date_input(
+                "End date",
+                value=default_end,
+                key="homesky_custom_backfill_end",
+            )
+            if st.button("Run custom backfill", key="homesky_custom_backfill_run"):
+                start_date = _as_date(custom_start, default_start)
+                end_date = _as_date(custom_end, default_end)
+                start_date, end_date = _normalize_date_pair(start_date, end_date)
+                mac_value = config.get("ambient", {}).get("mac") or ""
+                if not mac_value:
+                    st.error("Backfill requires a configured station MAC address.")
+                else:
+                    try:
+                        from homesky.backfill import backfill_range
+                    except ImportError as exc:  # pragma: no cover - compatibility
+                        st.error("Backfill utilities are unavailable in this build.")
+                        log.warning("Custom backfill unavailable: %s", exc)
+                    else:
+                        zone = _get_zone(tz_name)
+                        start_ts = _safe_localize_day(pd.Timestamp(start_date), zone)
+                        end_ts = (
+                            _safe_localize_day(pd.Timestamp(end_date), zone)
+                            + pd.Timedelta(days=1)
+                            - pd.Timedelta(seconds=1)
+                        )
+                        with st.spinner("Running custom backfill…"):
+                            try:
+                                result = backfill_range(
+                                    config=config,
+                                    storage=storage_manager,
+                                    start_dt=start_ts.tz_convert("UTC"),
+                                    end_dt=end_ts.tz_convert("UTC"),
+                                    mac=mac_value,
+                                    limit_per_call=int(
+                                        ingest_cfg.get("backfill_limit", 288) or 288
+                                    ),
+                                )
+                            except Exception as exc:  # pragma: no cover - UI feedback
+                                st.error(f"Custom backfill failed: {exc}")
+                                log.warning("Custom backfill failed: %s", exc)
+                            else:
+                                inserted = int(result.inserted)
+                                if inserted > 0:
+                                    st.success(
+                                        "Inserted {0:,} rows covering {1} – {2}.".format(
+                                            inserted,
+                                            _format_timestamp(result.start, tz_name),
+                                            _format_timestamp(result.end, tz_name),
+                                        )
+                                    )
+                                    st.toast(
+                                        f"Backfill added {inserted} rows", icon="✅"
+                                    )
+                                    load_data.clear()
+                                    _trigger_streamlit_rerun()
+                                else:
+                                    st.info(
+                                        "No new data found for the selected backfill range."
+                                    )
 
     metric_options = _available_metrics(df)
     if not metric_options:
@@ -829,26 +1062,51 @@ def _run_dashboard() -> None:
 
     min_ts = df_time.index.min()
     max_ts = df_time.index.max()
-    default_end = max_ts
-    default_start = max(default_end - timedelta(days=30), min_ts)
+    min_date = min_ts.date()
+    max_date = max_ts.date()
+    hint_start, hint_end = _default_window_last_10_days(tz_name)
+    default_start_date = max(hint_start, min_date)
+    default_end_date = min(hint_end, max_date)
+    if default_start_date > default_end_date:
+        default_start_date, default_end_date = min_date, max_date
+
     date_state_key = "homesky_date_range"
-    default_dates = get_date_range(default_start, default_end, date_state_key)
-    date_range = st.sidebar.date_input(
-        "Date range",
-        value=default_dates,
-        min_value=min_ts.date(),
-        max_value=max_ts.date(),
-        key=date_state_key,
+    default_dates = get_date_range(
+        pd.Timestamp(default_start_date), pd.Timestamp(default_end_date), date_state_key
     )
 
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        start_date, end_date = date_range
-    else:
-        start_date = date_range
-        end_date = date_range
-    start_date = _as_date(start_date, default_dates[0])
-    end_date = _as_date(end_date, default_dates[1])
+    from_key = "homesky_date_from"
+    to_key = "homesky_date_to"
+    st.session_state.setdefault(from_key, default_dates[0])
+    st.session_state.setdefault(to_key, default_dates[1])
+
+    st.caption("Select date range")
+    col_from, col_to = st.columns(2)
+    with col_from:
+        date_from = st.date_input(
+            "From",
+            value=st.session_state[from_key],
+            min_value=min_date,
+            max_value=max_date,
+            key=from_key,
+        )
+    with col_to:
+        date_to = st.date_input(
+            "To",
+            value=st.session_state[to_key],
+            min_value=min_date,
+            max_value=max_date,
+            key=to_key,
+        )
+
+    start_date = _as_date(date_from, default_dates[0])
+    end_date = _as_date(date_to, default_dates[1])
     start_date, end_date = _normalize_date_pair(start_date, end_date)
+    if start_date != date_from:
+        st.session_state[from_key] = start_date
+    if end_date != date_to:
+        st.session_state[to_key] = end_date
+    st.session_state[date_state_key] = (start_date, end_date)
     normalized_key = "_homesky_date_range_selected"
     st.session_state[normalized_key] = (start_date, end_date)
 

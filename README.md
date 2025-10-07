@@ -61,6 +61,9 @@ python .\homesky\gui.py
   **Backfill (custom)** to enter wider ranges; progress is checkpointed to `data/state/backfill.json` so interrupted jobs
   resume safely. The ingest service also backfills automatically on the first run using the `[ingest].backfill_hours`
   setting in `config.toml`, so there is no need to delete the existing database to "force" older data.
+- **Auto-sync on dashboard launch** – When Streamlit starts, HomeSky checks the newest database timestamp and only
+  requests missing observations. Toggle this behaviour via `[ingest] auto_sync_on_launch = true` in `config.toml` if you
+  prefer manual control. The GUI's **Fetch** button remains available for on-demand refreshes.
 - **API limits respected** – Ambient Weather limits each user key to ~1 request/sec (and each application key to 3/sec).
   HomeSky enforces these ceilings with a shared throttle, jitter, and exponential backoff (1s → 2s → 4s → 8s) so long
   backfills finish without `429` storms.
