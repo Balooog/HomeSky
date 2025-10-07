@@ -17,12 +17,28 @@ from pandas.api import types as ptypes
 import streamlit as st
 import traceback
 
-from homesky import ingest
+try:  # Package-aware import shim for Streamlit's execution context
+    if __package__:
+        from . import ingest  # type: ignore
+        from .utils.db import parse_obs_times  # type: ignore
+        from .utils.logging_setup import get_logger  # type: ignore
+    else:  # pragma: no cover - Streamlit sets __package__ to None
+        raise ImportError
+except Exception:  # pragma: no cover - fallback for direct script execution
+    import pathlib
+    import sys
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from homesky import ingest  # type: ignore
+    from homesky.utils.db import parse_obs_times  # type: ignore
+    from homesky.utils.logging_setup import get_logger  # type: ignore
+
 from homesky.rain_dashboard import compute_rainfall, render_rain_dashboard
 from homesky.utils.config import get_station_tz
 from homesky.utils.derived import compute_all_derived
 from homesky.utils.logging import setup_streamlit_logging
-from homesky.utils.logging_setup import get_logger
 from homesky.utils.theming import Theme, get_theme, load_typography
 
 
@@ -659,6 +675,29 @@ def _run_dashboard() -> None:
 
     _ensure_logging(config)
 
+    storage_manager = ingest.get_storage_manager(config)
+    ingest_cfg = config.get("ingest", {})
+    auto_sync_enabled = bool(ingest_cfg.get("auto_sync_on_launch", True))
+    auto_sync_done_key = "_homesky_auto_sync_done"
+    if auto_sync_enabled and not st.session_state.get(auto_sync_done_key, False):
+        with st.spinner("Checking for new observations…"):
+            try:
+                result = ingest.sync_new(config=config, storage=storage_manager)
+            except Exception as exc:  # pragma: no cover - surfaced to UI
+                st.session_state[auto_sync_done_key] = True
+                st.session_state["_homesky_auto_sync_error"] = str(exc)
+                log.warning("Auto-sync on launch failed: %s", exc)
+            else:
+                st.session_state[auto_sync_done_key] = True
+                st.session_state["_homesky_auto_sync_result"] = result
+                added = int(result.get("added", 0) or 0)
+                if added > 0:
+                    st.toast(f"Synced {added} new observations", icon="✅")
+                else:
+                    log.info("Auto-sync on launch: database already up-to-date")
+    elif not auto_sync_enabled:
+        st.session_state.setdefault(auto_sync_done_key, True)
+
     config_path = getattr(ingest.load_config, "last_path", None)
     if config_path is not None:
         st.caption(f"Config: {config_path}")
@@ -704,6 +743,39 @@ def _run_dashboard() -> None:
 
     st.title("HomeSky Dashboard")
 
+    auto_sync_error = st.session_state.get("_homesky_auto_sync_error")
+    auto_sync_result = st.session_state.get("_homesky_auto_sync_result")
+    if auto_sync_error:
+        st.warning(f"Auto-sync failed: {auto_sync_error}")
+    elif auto_sync_result:
+        added = int(auto_sync_result.get("added", 0) or 0)
+        skipped = int(auto_sync_result.get("skipped", 0) or 0)
+        since_raw = auto_sync_result.get("since")
+        until_raw = auto_sync_result.get("until")
+        since_ts = (
+            pd.to_datetime(since_raw, utc=True, errors="coerce")
+            if since_raw
+            else None
+        )
+        until_ts = (
+            pd.to_datetime(until_raw, utc=True, errors="coerce")
+            if until_raw
+            else None
+        )
+        summary_parts: List[str] = []
+        if added > 0:
+            summary_parts.append(f"added {added:,} rows")
+        else:
+            summary_parts.append("database already up-to-date")
+        if skipped > 0:
+            summary_parts.append(f"skipped {skipped:,}")
+        if since_ts is not None and not pd.isna(since_ts):
+            summary_parts.append(f"since {_format_timestamp(since_ts, tz_name)}")
+        if until_ts is not None and not pd.isna(until_ts):
+            summary_parts.append(f"latest {_format_timestamp(until_ts, tz_name)}")
+        if summary_parts:
+            st.caption("Auto-sync: " + " • ".join(summary_parts))
+
     st.markdown(
         f"<div style='display:inline-block;padding:0.35rem 0.75rem;border-radius:999px;"
         f"background-color:{theme.primary};color:white;font-weight:600;'>"
@@ -729,6 +801,113 @@ def _run_dashboard() -> None:
                     pass
         _trigger_streamlit_rerun()
         return
+
+    with st.sidebar.expander("Advanced ingestion", expanded=False):
+        st.caption(
+            "Backfill operations use the Ambient history API and may take several minutes."
+        )
+        show_backfill_controls = st.checkbox(
+            "Show backfill controls",
+            value=False,
+            key="homesky_show_backfill_controls",
+        )
+        if show_backfill_controls:
+            if st.button("Backfill last 24 hours", key="homesky_backfill_24h"):
+                with st.spinner("Backfilling last 24 hours…"):
+                    try:
+                        inserted = ingest.backfill(
+                            config,
+                            24,
+                            storage=storage_manager,
+                            tz=tz_name,
+                        )
+                    except Exception as exc:  # pragma: no cover - surfaced to UI
+                        st.error(f"Backfill failed: {exc}")
+                        log.warning("Backfill (24h) failed: %s", exc)
+                    else:
+                        if inserted:
+                            st.success(
+                                f"Inserted {inserted} rows from the last 24 hours."
+                            )
+                            st.toast(f"Backfill added {inserted} rows", icon="✅")
+                        else:
+                            st.info("No new observations found in the last 24 hours.")
+                        load_data.clear()
+                        _trigger_streamlit_rerun()
+
+        enable_custom_backfill = st.checkbox(
+            "Enable custom backfill",
+            value=False,
+            key="homesky_enable_custom_backfill",
+        )
+        if enable_custom_backfill:
+            default_start = date.today() - timedelta(days=7)
+            default_end = date.today()
+            custom_start = st.date_input(
+                "Start date",
+                value=default_start,
+                key="homesky_custom_backfill_start",
+            )
+            custom_end = st.date_input(
+                "End date",
+                value=default_end,
+                key="homesky_custom_backfill_end",
+            )
+            if st.button("Run custom backfill", key="homesky_custom_backfill_run"):
+                start_date = _as_date(custom_start, default_start)
+                end_date = _as_date(custom_end, default_end)
+                start_date, end_date = _normalize_date_pair(start_date, end_date)
+                mac_value = config.get("ambient", {}).get("mac") or ""
+                if not mac_value:
+                    st.error("Backfill requires a configured station MAC address.")
+                else:
+                    try:
+                        from homesky.backfill import backfill_range
+                    except ImportError as exc:  # pragma: no cover - compatibility
+                        st.error("Backfill utilities are unavailable in this build.")
+                        log.warning("Custom backfill unavailable: %s", exc)
+                    else:
+                        zone = _get_zone(tz_name)
+                        start_ts = _safe_localize_day(pd.Timestamp(start_date), zone)
+                        end_ts = (
+                            _safe_localize_day(pd.Timestamp(end_date), zone)
+                            + pd.Timedelta(days=1)
+                            - pd.Timedelta(seconds=1)
+                        )
+                        with st.spinner("Running custom backfill…"):
+                            try:
+                                result = backfill_range(
+                                    config=config,
+                                    storage=storage_manager,
+                                    start_dt=start_ts.tz_convert("UTC"),
+                                    end_dt=end_ts.tz_convert("UTC"),
+                                    mac=mac_value,
+                                    limit_per_call=int(
+                                        ingest_cfg.get("backfill_limit", 288) or 288
+                                    ),
+                                )
+                            except Exception as exc:  # pragma: no cover - UI feedback
+                                st.error(f"Custom backfill failed: {exc}")
+                                log.warning("Custom backfill failed: %s", exc)
+                            else:
+                                inserted = int(result.inserted)
+                                if inserted > 0:
+                                    st.success(
+                                        "Inserted {0:,} rows covering {1} – {2}.".format(
+                                            inserted,
+                                            _format_timestamp(result.start, tz_name),
+                                            _format_timestamp(result.end, tz_name),
+                                        )
+                                    )
+                                    st.toast(
+                                        f"Backfill added {inserted} rows", icon="✅"
+                                    )
+                                    load_data.clear()
+                                    _trigger_streamlit_rerun()
+                                else:
+                                    st.info(
+                                        "No new data found for the selected backfill range."
+                                    )
 
     metric_options = _available_metrics(df)
     if not metric_options:
