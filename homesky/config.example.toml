@@ -31,6 +31,7 @@ enable_wind_run = true
 [ingest]
 deduplicate_by_timestamp = true
 drop_implausible_values = true
+auto_sync_on_launch = true
 log_path = "./data/logs/ingest.log"
 log_rotate_days = 14
 max_retries = 3
